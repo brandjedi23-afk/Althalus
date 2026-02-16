@@ -249,6 +249,17 @@ async def session_reset(
         p.unlink()
     return {"ok": True, "session_id": str(sid)}
 
+@app.post("/session/reset/{session_id}")
+def session_reset_path(session_id: str) -> Dict[str, Any]:
+    if not session_id or not session_id.strip():
+        raise HTTPException(status_code=422, detail="session_id requerido")
+
+    p = _session_path(session_id)
+    if p.exists():
+        p.unlink()
+
+    return {"ok": True, "session_id": session_id}
+
 @app.get("/session/{session_id}")
 def session_dump(session_id: str) -> Dict[str, Any]:
     p = _session_path(session_id)
