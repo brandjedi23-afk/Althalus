@@ -2483,24 +2483,27 @@ def _filter_args_to_signature(fn: Callable[..., Any], args: dict) -> Tuple[dict,
 def _normalize_history_for_chat(history: list) -> list:
     """
     Convierte historial viejo (Responses API) a formato Chat Completions.
-    - content [{"type":"input_text","text":...}]  -> content "..."
-    - ignora items no-mensaje tipo function_call / function_call_output
+
+    Fix crítico:
+    - Conserva tool_calls en mensajes del assistant.
+    - Elimina mensajes tool "huérfanos" (sin tool_calls previos) para evitar:
+      "messages with role 'tool' must be a response to a preceeding message with 'tool_calls'."
     """
     out = []
+    pending_tool_ids = set()  # tool_call_ids esperados tras un assistant con tool_calls
+
     for m in history or []:
         if not isinstance(m, dict):
             continue
 
         role = m.get("role")
         if role not in {"system", "user", "assistant", "tool"}:
-            # descarta items tipo {"type":"function_call"...}
             continue
 
         content = m.get("content")
 
         # Caso Responses: content = [{"type":"input_text","text":"..."}]
         if isinstance(content, list) and content:
-            # concatena bloques de texto
             parts = []
             for c in content:
                 if isinstance(c, dict):
@@ -2509,15 +2512,51 @@ def _normalize_history_for_chat(history: list) -> list:
                         parts.append(str(c.get("text") or ""))
             content = "\n".join([p for p in parts if p.strip()])
 
-        # Caso tool: Chat Completions requiere tool_call_id
-        if role == "tool":
-            tool_call_id = m.get("tool_call_id") or m.get("toolCallId") or m.get("call_id") or m.get("id")
-            if not tool_call_id:
-                # si no podemos mapearlo, lo saltamos
-                continue
-            out.append({"role": "tool", "tool_call_id": tool_call_id, "content": str(content or "")})
+        # Assistant: conservar tool_calls si existen
+        if role == "assistant":
+            msg = {"role": "assistant", "content": str(content or "")}
+
+            tool_calls = m.get("tool_calls") or []
+            if isinstance(tool_calls, list) and tool_calls:
+                # Normaliza ids de tool_calls
+                ids = set()
+                norm_calls = []
+                for tc in tool_calls:
+                    if hasattr(tc, "model_dump"):
+                        tc = tc.model_dump()
+                    if isinstance(tc, dict):
+                        tc_id = tc.get("id") or tc.get("tool_call_id")
+                        if tc_id:
+                            ids.add(tc_id)
+                        norm_calls.append(tc)
+                msg["tool_calls"] = norm_calls
+                pending_tool_ids = ids
+            else:
+                pending_tool_ids = set()
+
+            out.append(msg)
             continue
 
+        # Tool: Chat Completions requiere tool_call_id y debe corresponder a tool_calls previos
+        if role == "tool":
+            tool_call_id = (
+                m.get("tool_call_id")
+                or m.get("toolCallId")
+                or m.get("call_id")
+                or m.get("id")
+            )
+            if not tool_call_id:
+                continue
+
+            # Si no hay tool_calls previos o no coincide, es "huérfano" -> lo descartamos
+            if not pending_tool_ids or tool_call_id not in pending_tool_ids:
+                continue
+
+            out.append({"role": "tool", "tool_call_id": tool_call_id, "content": str(content or "")})
+            pending_tool_ids.discard(tool_call_id)
+            continue
+
+        # system/user: normal
         out.append({"role": role, "content": str(content or "")})
 
     return out
