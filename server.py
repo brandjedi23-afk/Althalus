@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
@@ -56,7 +56,7 @@ except Exception as e:
 # -----------------------------
 # FastAPI app
 # -----------------------------
-app = FastAPI(title="DM Agent API", version="1.2.0")
+app = FastAPI(title="DM Agent API", version="1.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -99,6 +99,9 @@ class TurnRequest(BaseModel):
 class TurnResponse(BaseModel):
     session_id: str
     output: str
+
+class SessionResetRequest(BaseModel):
+    session_id: str
 
 # -----------------------------
 # Sesiones
@@ -210,15 +213,41 @@ def turn(req: TurnRequest):
     save_state(req.session_id, state)
     return TurnResponse(session_id=req.session_id, output=str(output))
 
-class SessionResetRequest(BaseModel):
-    session_id: str
-
+# --- RESET: robusto ante bodies vacíos de Actions ---
 @app.post("/session/reset")
-def session_reset(req: SessionResetRequest) -> Dict[str, Any]:
-    p = _session_path(req.session_id)
+async def session_reset(
+    request: Request,
+    session_id: Optional[str] = Query(None),
+    req: Optional[SessionResetRequest] = Body(None),
+) -> Dict[str, Any]:
+    # 1) Preferimos body JSON (si llegó bien)
+    sid: Optional[str] = None
+    if req and getattr(req, "session_id", None):
+        sid = req.session_id
+
+    # 2) Compatibilidad: query param
+    if not sid and session_id:
+        sid = session_id
+
+    # 3) Tolerancia: intentar leer JSON crudo (Actions a veces manda {})
+    if not sid:
+        try:
+            data = await request.json()
+            if isinstance(data, dict):
+                sid = data.get("session_id")
+        except Exception:
+            pass
+
+    if not sid or not str(sid).strip():
+        return JSONResponse(
+            status_code=422,
+            content={"detail": [{"type": "missing", "loc": ["body", "session_id"], "msg": "Field required", "input": {}}]},
+        )
+
+    p = _session_path(str(sid))
     if p.exists():
         p.unlink()
-    return {"ok": True, "session_id": req.session_id}
+    return {"ok": True, "session_id": str(sid)}
 
 @app.get("/session/{session_id}")
 def session_dump(session_id: str) -> Dict[str, Any]:
