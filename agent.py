@@ -2327,6 +2327,12 @@ REGLAS DE USO:
 - Después de una resolución importante, registra 1–2 líneas con log_event().
 - No inventes números si importan: consulta el canon.
 - Para tiradas de habilidad de un PJ, usa skill_check(actor, skill, dc, mode) para calcular bonus automáticamente.
+
+MODO ESCENA (CRÍTICO):
+- dm_turn NO ES “solo combate”. Si no hay combate activo, SIEMPRE continúas la aventura en modo escena (exploración/social/decisiones).
+- Nunca respondas “no hay combate activo” como bloqueo. Si no hay combate, describes la situación actual, propones 2–4 opciones y pides una decisión.
+- Si falta contexto de escena, usa scene_status y canon_get para anclar continuidad antes de describir.
+
 - REGLA CRÍTICA DE TRANSPARENCIA:
   Siempre que llames a una tool mecánica (roll/check/skill_check/attack/start_combat/combat_status/target_status),
   en tu siguiente mensaje DEBES incluir una sección "RESOLUCIÓN (mecánica)" y pegar el output de la tool literalmente
@@ -2617,6 +2623,23 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
         # 3) Sin tools: devuelve texto final
         text = (msg.content or "").strip()
         if text:
+            # Si el modelo se “auto-bloquea” por combate, forzamos un retry 1 vez en modo escena
+            if re.search(r"no hay un combate activo", text, re.IGNORECASE):
+                state.history.append(_assistant_msg(text))
+                state.history.append(_user_msg(
+                    "Continúa en MODO ESCENA (sin combate): describe la situación actual, mantén continuidad, "
+                    "da 2–4 opciones accionables. No te bloquees por falta de combate."
+                ))
+                try:
+                    resp = _call_chat_with_retries(state.history)
+                    msg2 = resp.choices[0].message
+                    text2 = (msg2.content or "").strip()
+                    if text2:
+                        state.history.append(_assistant_msg(text2))
+                        return text2
+                except Exception as e:
+                    return f"Error llamando al modelo tras retry modo escena: {e}"
+
             state.history.append(_assistant_msg(text))
             return text
 
