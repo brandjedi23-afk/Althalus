@@ -2685,16 +2685,27 @@ _TERM_ALIASES = {
     "sharp shoot": "sharpshooter",
     "sharp shooter": "sharpshooter",
     "sharpshoot": "sharpshooter",
-    "great weapon mastery": "great weapon master",
-    "gwm": "great weapon master",
     "ss": "sharpshooter",
+
+    "great weapon mastery": "great weapon master",
+    "great weapon master": "great weapon master",
+    "gwm": "great weapon master",
+
+    "pole arm mastery": "polearm master",
+    "polearm mastery": "polearm master",
+    "polearm master": "polearm master",
+    "pam": "polearm master",
+
+    "sentinel": "sentinel",
 
     # Combat terms
     "sneak attack": "sneak attack",
     "sa": "sneak attack",
 
-    # Spanish -> canonical concept tokens (kept as terms)
+    # Spanish -> canonical concept tokens
     "sigilo": "stealth",
+    "melé": "melee",
+    "mele": "melee",
 }
 
 # Nombres que el usuario suele usar como “actor” aunque no esté en party
@@ -2719,43 +2730,84 @@ def _apply_term_aliases(text: str) -> Tuple[str, list]:
 def _inject_intent_hints(text: str) -> str:
     """
     Intents: asunciones razonables para que el DM no sea literal.
+    - multiataques (Extra Attack)
+    - primer asalto (Gloom Stalker)
+    - bonus actions/reactions (GWM/PAM/Sentinel)
     """
     t = text or ""
     tl = t.lower()
 
-    # (A) Ataque a melé => moverse y atacar si es posible
-    wants_melee = any(k in tl for k in ["a melé", "a melee", "melee", "cuerpo a cuerpo"])
-    mentions_attack = any(k in tl for k in ["ataca", "ataque", "golpea", "carga", "embiste"])
-    if wants_melee and mentions_attack:
+    # Detectores básicos
+    mentions_attack = any(k in tl for k in ["ataca", "ataque", "golpea", "dispara", "carga", "embiste", "strike", "shoot"])
+    wants_melee = any(k in tl for k in ["melee", "cuerpo a cuerpo", "close"])
+    mentions_first_round = any(k in tl for k in ["primer asalto", "primer turno", "first round", "round 1", "turno 1"])
+
+    # (A) Ataque melé => moverse y atacar si es posible
+    if mentions_attack and (wants_melee or "melee" in tl):
         t += (
-            "\n\n[INTENCIÓN IMPLÍCITA: si el atacante no está ya a melé, asume que se mueve lo necesario "
-            "para ponerse a melé (usando su movimiento) y luego ejecuta el ataque en el mismo turno, "
-            "salvo que sea físicamente imposible.]"
+            "\n\n[INTENCIÓN IMPLÍCITA: si el atacante no está ya en rango, asume que se mueve lo necesario "
+            "para ponerse en rango (usando su movimiento) y luego ejecuta los ataques.]"
         )
 
-    # (B) Sharpshooter / GWM => el usuario suele querer “usar el feat” automáticamente
+    # (B) Rutina completa de ataques (Extra Attack) salvo que el usuario pida explícitamente 1 ataque
+    # Nota: no podemos leer niveles/clase aquí; esto es una orden al modelo para que NO sea literal.
+    if mentions_attack and not any(k in tl for k in ["solo un ataque", "un único ataque", "only one attack", "1 ataque"]):
+        t += (
+            "\n\n[INTENCIÓN IMPLÍCITA (MULTIATAQUE): si el actor tiene Extra Attack o ataques múltiples por nivel/rasgo, "
+            "ejecuta la rutina completa del turno (p. ej., 2 ataques a nivel 5+ para guerrero/ranger/paladín) "
+            "sin pedir confirmación por cada golpe. Solo para si hay una decisión táctica real.]"
+        )
+
+    # (C) Gloom Stalker: ataque extra en el primer asalto (si aplica)
+    if ("gloom stalker" in tl) or ("dread ambusher" in tl) or mentions_first_round:
+        t += (
+            "\n\n[INTENCIÓN IMPLÍCITA (GLOOM STALKER): en el primer asalto, si el actor es Gloom Stalker "
+            "aplica el ataque adicional de Dread Ambusher (y su daño extra) dentro de la misma secuencia.]"
+        )
+
+    # (D) Sharpshooter / GWM: asumir que quiere usar el feat (-5/+10) cuando menciona SS/GWM
     if "sharpshooter" in tl or "great weapon master" in tl:
         t += (
-            "\n\n[INTENCIÓN IMPLÍCITA: si el usuario menciona Sharpshooter o Great Weapon Master, asume que "
-            "quiere aplicar su opción de -5/+10 (si procede) y explica brevemente el impacto. "
-            "Si no procede (por reglas/arma), indícalo sin bloquear.]"
+            "\n\n[INTENCIÓN IMPLÍCITA (SS/GWM): si el usuario menciona Sharpshooter o Great Weapon Master, "
+            "asume que quiere aplicar -5/+10 cuando sea legal y razonable. Si no procede, dilo sin bloquear.]"
         )
 
-    # (C) Sneak Attack => si hay condiciones razonables, aplícalo sin que el usuario lo “pida perfecto”
+    # (E) GWM bonus attack: al crit o al reducir a 0 PV, recordar bonus action de ataque
+    if "great weapon master" in tl:
+        t += (
+            "\n\n[TRIGGER (GWM): si durante esta secuencia hay un crítico o reduces a 0 PV, recuerda ofrecer/ejecutar "
+            "el ataque adicional como bonus action (si la bonus action está libre).]"
+        )
+
+    # (F) Polearm Master: reacción al entrar en alcance (normalmente 10 pies) + bonus action butt-end
+    if "polearm master" in tl:
+        t += (
+            "\n\n[TRIGGER (PAM): si un enemigo entra en tu alcance, considera ataque de oportunidad especial (reacción). "
+            "En tu turno, recuerda el ataque de bonus action con el extremo del arma si procede.]"
+        )
+
+    # (G) Sentinel: OA si intenta salir del alcance (y reduce speed a 0); también castiga disengage según 5e
+    if "sentinel" in tl:
+        t += (
+            "\n\n[TRIGGER (SENTINEL): si el objetivo intenta salir de tu alcance, realiza OA si procede; "
+            "al impactar, su velocidad pasa a 0. No bloquees por disengage si Sentinel aplica.]"
+        )
+
+    # (H) Sneak Attack: aplicarlo si hay condiciones
     if "sneak attack" in tl:
         t += (
-            "\n\n[INTENCIÓN IMPLÍCITA: si el usuario menciona Sneak Attack, aplica SA si se cumplen condiciones "
-            "(ventaja, o aliado adyacente al objetivo, etc.). Si no se cumplen, dilo y sugiere cómo habilitarlo.]"
+            "\n\n[INTENCIÓN IMPLÍCITA (SNEAK ATTACK): aplica SA si se cumplen condiciones (ventaja, o aliado adyacente, etc.). "
+            "Si no se cumplen, dilo y sugiere cómo habilitarlo.]"
         )
 
-    # (D) Sigilo/Stealth => el usuario quiere moverse con cautela y tirar stealth cuando haga falta
+    # (I) Stealth: pedir tirada solo cuando haya riesgo real
     if "stealth" in tl or "sigilo" in tl:
         t += (
-            "\n\n[INTENCIÓN IMPLÍCITA: si el usuario indica sigilo/stealth, asume movimiento cauteloso y pide "
-            "una tirada de Stealth solo cuando haya riesgo real de ser detectado. No bloquees por ello.]"
+            "\n\n[INTENCIÓN IMPLÍCITA (STEALTH): si el usuario indica sigilo, asume movimiento cauteloso y pide "
+            "Stealth solo cuando haya riesgo real de detección. No bloquees por ello.]"
         )
 
-    # (E) PNJs no registrados (Eldrin, etc.)
+    # (J) PNJs no registrados (Eldrin, etc.)
     for name in _DEFAULT_ASSUME_NPC_NAMES:
         if re.search(rf"\b{re.escape(name)}\b", tl):
             t += (
