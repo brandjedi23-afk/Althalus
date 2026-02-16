@@ -2815,6 +2815,16 @@ def _inject_intent_hints(text: str) -> str:
                 "en la escena (no bloquees). Si necesitas concretar stats/rol, pregunta 1 cosa concreta.]"
             )
             break
+    
+    # (K) Visibilidad de tiradas: si hay acción con azar, forzar uso de tools y output literal
+    if mentions_attack or any(k in tl for k in ["tirada", "d20", "daño", "damage", "salvación", "saving throw", "check"]):
+        t += (
+            "\n\n[OBLIGATORIO (TIRADAS VISIBLES): resuelve mecánicas usando tools. "
+            "Para ataques usa tool_attack (una vez por cada ataque). "
+            "Para daño/otros usa tool_roll. Para checks usa tool_check o tool_skill_check. "
+            "Después pega SIEMPRE el output literal en la sección RESOLUCIÓN (mecánica). "
+            "No narres resultados sin tiradas visibles.]"
+        )
 
     return t
 
