@@ -113,7 +113,6 @@ def _session_path(session_id: str) -> Path:
     return SESSIONS_DIR / f"{safe}.json"
 
 def load_state(session_id: str):
-    # Agent no disponible -> devolvemos None y manejamos arriba
     if not AgentState:
         return None
 
@@ -123,18 +122,44 @@ def load_state(session_id: str):
 
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
     except Exception:
-        return AgentState()  # type: ignore
+        data = {}
 
     st = AgentState()  # type: ignore
+
+    # history
     hist = data.get("history", [])
     if isinstance(hist, list):
         st.history = hist
+
+    # scene/location/flags/module_progress (todo opcional y retrocompatible)
+    scene = data.get("scene", None)
+    if isinstance(scene, dict):
+        st.scene.update(scene)
+
+    flags = data.get("flags", None)
+    if isinstance(flags, dict):
+        st.flags.update(flags)
+
+    module_progress = data.get("module_progress", None)
+    if isinstance(module_progress, dict):
+        st.module_progress.update(module_progress)
+
     return st
+
 
 def save_state(session_id: str, state) -> None:
     p = _session_path(session_id)
-    payload = {"history": getattr(state, "history", [])}
+
+    payload = {
+        "history": getattr(state, "history", []),
+        "scene": getattr(state, "scene", {}),
+        "flags": getattr(state, "flags", {}),
+        "module_progress": getattr(state, "module_progress", {}),
+    }
+
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(p)

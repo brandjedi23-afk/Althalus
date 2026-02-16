@@ -367,6 +367,13 @@ def tool_module_set_progress(chapter: str = "", scene: str = "", add_flags_json:
 
     canon_save(canon)
 
+    st = _get_state()
+    if st is not None:
+        st.module_progress["module_id"] = mod.get("id") or st.module_progress.get("module_id", "")
+        st.module_progress["chapter"] = progress.get("chapter", "")
+        st.module_progress["scene"] = progress.get("scene", "")
+        st.module_progress["flags"] = progress.get("flags", [])
+
     return json.dumps({
         "ok": True,
         "module_id": mid,
@@ -1308,14 +1315,39 @@ def tool_retreat(actor: str) -> str:
 # Tools: escena
 # =========================================================
 def tool_start_scene(location: str, hook: str) -> str:
+    # 1) Persistencia por sesión (AgentState)
+    st = _get_state()
+    if st is not None:
+        st.scene["location"] = location
+        st.scene["current_scene"] = hook
+        # no machacamos recap/open_threads si ya existen
+
+    # 2) Compatibilidad hacia atrás (canon.session global)
     canon = canon_load()
     session = _ensure_dict(canon, "session")
     session["location"] = location
     session["current_scene"] = hook
     canon_save(canon)
+
     return f"Escena iniciada. Lugar: {location}. Gancho: {hook}"
 
+
 def tool_scene_status() -> str:
+    st = _get_state()
+
+    # Preferimos estado por sesión si existe
+    if st is not None and isinstance(st.scene, dict):
+        out = {
+            "location": st.scene.get("location", ""),
+            "current_scene": st.scene.get("current_scene", ""),
+            "recap": st.scene.get("recap", ""),
+            "open_threads": st.scene.get("open_threads", []),
+            "flags": st.flags,
+            "module_progress": st.module_progress,
+        }
+        return json.dumps(out, ensure_ascii=False, indent=2)
+
+    # Fallback a canon.session (compat)
     canon = canon_load()
     session = canon.get("session", {}) or {}
     out = {
@@ -2359,7 +2391,27 @@ import inspect
 
 @dataclass
 class AgentState:
-    history: List[dict] = field(default_factory=list)  # Chat Completions messages
+    # Historial para el LLM (Chat Completions messages)
+    history: List[dict] = field(default_factory=list)
+
+    # Estado persistente "ligero" (no depende de releer todo history)
+    scene: Dict[str, Any] = field(default_factory=lambda: {
+        "location": "",
+        "current_scene": "",
+        "recap": "",
+        "open_threads": [],
+    })
+
+    # Flags generales de campaña (decisiones, puertas abiertas, PNJ hostiles, etc.)
+    flags: Dict[str, Any] = field(default_factory=dict)
+
+    # Progreso del módulo (si se usa)
+    module_progress: Dict[str, Any] = field(default_factory=lambda: {
+        "module_id": "",
+        "chapter": "",
+        "scene": "",
+        "flags": [],
+    })
 
 def _system_msg() -> dict:
     return {"role": "system", "content": SYSTEM}
@@ -2375,6 +2427,11 @@ def _assistant_msg(text: str) -> dict:
 
 def _tool_msg(tool_call_id: str, output: str) -> dict:
     return {"role": "tool", "tool_call_id": tool_call_id, "content": str(output)}
+
+_ACTIVE_STATE: Optional["AgentState"] = None
+
+def _get_state() -> Optional["AgentState"]:
+    return _ACTIVE_STATE
 
 def _schemas_to_chat_tools(tool_schemas: list) -> list:
     """
@@ -2568,82 +2625,92 @@ def _normalize_history_for_chat(history: list) -> list:
     return out
 
 def run_agent_turn(user_text: str, state: AgentState) -> str:
-    state.history = _normalize_history_for_chat(state.history)
-
-    if not state.history or state.history[0].get("role") != "system":
-        state.history.insert(0, _system_msg())
-
-    state.history.append(_user_msg(user_text))
-
+    """
+    Ejecuta un turno del agente.
+    A3: activa un puntero global al AgentState actual para que las tools puedan
+    persistir scene/location/flags/module_progress en la sesión (no solo en history).
+    """
+    global _ACTIVE_STATE
+    _ACTIVE_STATE = state
     try:
-        resp = _call_chat_with_retries(state.history)
-    except Exception as e:
-        return f"Error llamando al modelo: {e}"
+        state.history = _normalize_history_for_chat(state.history)
 
-    while True:
-        msg = resp.choices[0].message
+        if not state.history or state.history[0].get("role") != "system":
+            state.history.insert(0, _system_msg())
 
-        # 1) Si hay tool calls, ejecútalas
-        tool_calls = getattr(msg, "tool_calls", None) or []
-        if tool_calls:
-            # guarda el mensaje del assistant tal cual (con tool_calls)
-            state.history.append({
-                "role": "assistant",
-                "content": msg.content or "",
-                "tool_calls": [tc.model_dump() if hasattr(tc, "model_dump") else tc for tc in tool_calls],
-            })
+        state.history.append(_user_msg(user_text))
 
-            for tc in tool_calls:
-                tc_id = tc.id
-                fn_name = tc.function.name
-                fn_args = _parse_tool_args(tc.function.arguments)
+        try:
+            resp = _call_chat_with_retries(state.history)
+        except Exception as e:
+            return f"Error llamando al modelo: {e}"
 
-                fn = TOOLS.get(fn_name)
-                if not fn:
-                    out = f"Error: herramienta '{fn_name}' no existe en TOOLS."
-                else:
-                    filtered_args, dropped = _filter_args_to_signature(fn, fn_args)
-                    try:
-                        out = fn(**filtered_args)
-                        if dropped:
-                            out = f"{out}\n(WARN: args ignorados por no estar en la firma: {dropped})"
-                    except Exception as e:
-                        out = f"Error ejecutando {fn_name}: {e}"
+        while True:
+            msg = resp.choices[0].message
 
-                state.history.append(_tool_msg(tc_id, str(out)))
+            # 1) Si hay tool calls, ejecútalas
+            tool_calls = getattr(msg, "tool_calls", None) or []
+            if tool_calls:
+                # guarda el mensaje del assistant tal cual (con tool_calls)
+                state.history.append({
+                    "role": "assistant",
+                    "content": msg.content or "",
+                    "tool_calls": [tc.model_dump() if hasattr(tc, "model_dump") else tc for tc in tool_calls],
+                })
 
-            # 2) vuelve a llamar al modelo con tool outputs ya en messages
-            try:
-                resp = _call_chat_with_retries(state.history)
-            except Exception as e:
-                return f"Error llamando al modelo tras tools: {e}"
+                for tc in tool_calls:
+                    tc_id = tc.id
+                    fn_name = tc.function.name
+                    fn_args = _parse_tool_args(tc.function.arguments)
 
-            continue
+                    fn = TOOLS.get(fn_name)
+                    if not fn:
+                        out = f"Error: herramienta '{fn_name}' no existe en TOOLS."
+                    else:
+                        filtered_args, dropped = _filter_args_to_signature(fn, fn_args)
+                        try:
+                            out = fn(**filtered_args)
+                            if dropped:
+                                out = f"{out}\n(WARN: args ignorados por no estar en la firma: {dropped})"
+                        except Exception as e:
+                            out = f"Error ejecutando {fn_name}: {e}"
 
-        # 3) Sin tools: devuelve texto final
-        text = (msg.content or "").strip()
-        if text:
-            # Si el modelo se “auto-bloquea” por combate, forzamos un retry 1 vez en modo escena
-            if re.search(r"no hay un combate activo", text, re.IGNORECASE):
-                state.history.append(_assistant_msg(text))
-                state.history.append(_user_msg(
-                    "Continúa en MODO ESCENA (sin combate): describe la situación actual, mantén continuidad, "
-                    "da 2–4 opciones accionables. No te bloquees por falta de combate."
-                ))
+                    state.history.append(_tool_msg(tc_id, str(out)))
+
+                # 2) vuelve a llamar al modelo con tool outputs ya en messages
                 try:
                     resp = _call_chat_with_retries(state.history)
-                    msg2 = resp.choices[0].message
-                    text2 = (msg2.content or "").strip()
-                    if text2:
-                        state.history.append(_assistant_msg(text2))
-                        return text2
                 except Exception as e:
-                    return f"Error llamando al modelo tras retry modo escena: {e}"
+                    return f"Error llamando al modelo tras tools: {e}"
 
-            state.history.append(_assistant_msg(text))
-            return text
+                continue
 
-        return "(Sin salida de texto; revisa el prompt/tools.)"
+            # 3) Sin tools: devuelve texto final
+            text = (msg.content or "").strip()
+            if text:
+                # Si el modelo se “auto-bloquea” por combate, forzamos un retry 1 vez en modo escena
+                if re.search(r"no hay un combate activo", text, re.IGNORECASE):
+                    state.history.append(_assistant_msg(text))
+                    state.history.append(_user_msg(
+                        "Continúa en MODO ESCENA (sin combate): describe la situación actual, mantén continuidad, "
+                        "da 2–4 opciones accionables. No te bloquees por falta de combate."
+                    ))
+                    try:
+                        resp = _call_chat_with_retries(state.history)
+                        msg2 = resp.choices[0].message
+                        text2 = (msg2.content or "").strip()
+                        if text2:
+                            state.history.append(_assistant_msg(text2))
+                            return text2
+                    except Exception as e:
+                        return f"Error llamando al modelo tras retry modo escena: {e}"
+
+                state.history.append(_assistant_msg(text))
+                return text
+
+            return "(Sin salida de texto; revisa el prompt/tools.)"
+    finally:
+        _ACTIVE_STATE = None
 
 # =========================================================
 # CLI (robusto + modo local)
