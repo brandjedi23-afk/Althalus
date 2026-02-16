@@ -25,7 +25,6 @@ SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 PUBLIC_PATHS = {"/", "/favicon.ico", "/health", "/config", "/docs", "/openapi.json", "/redoc"}
 
 def _get_api_token() -> str:
-    # ✅ se lee en runtime (no solo en import) para evitar “token vacío” por orden de carga
     return (os.getenv("DM_API_TOKEN") or "").strip()
 
 def _auth_ok(request: Request, token: str) -> bool:
@@ -56,7 +55,7 @@ except Exception as e:
 # -----------------------------
 # FastAPI app
 # -----------------------------
-app = FastAPI(title="DM Agent API", version="1.2.1")
+app = FastAPI(title="DM Agent API", version="1.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,22 +69,15 @@ app.add_middleware(
 async def require_token(request: Request, call_next):
     path = request.url.path
 
-    # deja pasar endpoints públicos
     if path in PUBLIC_PATHS:
         return await call_next(request)
 
     token = _get_api_token()
     if not token:
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "Servidor sin DM_API_TOKEN configurado"},
-        )
+        return JSONResponse(status_code=503, content={"detail": "Servidor sin DM_API_TOKEN configurado"})
 
     if not _auth_ok(request, token):
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Unauthorized"},
-        )
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
     return await call_next(request)
 
@@ -99,9 +91,6 @@ class TurnRequest(BaseModel):
 class TurnResponse(BaseModel):
     session_id: str
     output: str
-
-class SessionResetRequest(BaseModel):
-    session_id: str
 
 # -----------------------------
 # Sesiones
@@ -134,21 +123,22 @@ def load_state(session_id: str):
     if isinstance(hist, list):
         st.history = hist
 
-    # scene/location/flags/module_progress (todo opcional y retrocompatible)
+    # scene
     scene = data.get("scene", None)
-    if isinstance(scene, dict):
-        st.scene.update(scene)
+    if isinstance(scene, dict) and hasattr(st, "scene") and isinstance(getattr(st, "scene", None), dict):
+        st.scene.update(scene)  # type: ignore
 
+    # flags
     flags = data.get("flags", None)
-    if isinstance(flags, dict):
-        st.flags.update(flags)
+    if isinstance(flags, dict) and hasattr(st, "flags") and isinstance(getattr(st, "flags", None), dict):
+        st.flags.update(flags)  # type: ignore
 
+    # module_progress
     module_progress = data.get("module_progress", None)
-    if isinstance(module_progress, dict):
-        st.module_progress.update(module_progress)
+    if isinstance(module_progress, dict) and hasattr(st, "module_progress") and isinstance(getattr(st, "module_progress", None), dict):
+        st.module_progress.update(module_progress)  # type: ignore
 
     return st
-
 
 def save_state(session_id: str, state) -> None:
     p = _session_path(session_id)
@@ -182,7 +172,7 @@ def _check_runtime_ready() -> Dict[str, Any]:
     return {"ok": True, "model": model}
 
 # -----------------------------
-# Endpoints
+# Endpoints públicos
 # -----------------------------
 @app.get("/")
 def root() -> Dict[str, Any]:
@@ -194,7 +184,6 @@ def health() -> Dict[str, Any]:
 
 @app.get("/config")
 def config() -> Dict[str, Any]:
-    # público (no devuelve secretos)
     ready = _check_runtime_ready()
     return {
         "ready": ready,
@@ -209,6 +198,9 @@ def config() -> Dict[str, Any]:
 def favicon():
     return Response(status_code=204)
 
+# -----------------------------
+# Turno DM
+# -----------------------------
 @app.post("/turn", response_model=TurnResponse)
 def turn(req: TurnRequest):
     if AGENT_IMPORT_ERROR or not AgentState or not run_agent_turn:
@@ -238,42 +230,9 @@ def turn(req: TurnRequest):
     save_state(req.session_id, state)
     return TurnResponse(session_id=req.session_id, output=str(output))
 
-# --- RESET: robusto ante bodies vacíos de Actions ---
-@app.post("/session/reset")
-async def session_reset(
-    request: Request,
-    session_id: Optional[str] = Query(None),
-    req: Optional[SessionResetRequest] = Body(None),
-) -> Dict[str, Any]:
-    # 1) Preferimos body JSON (si llegó bien)
-    sid: Optional[str] = None
-    if req and getattr(req, "session_id", None):
-        sid = req.session_id
-
-    # 2) Compatibilidad: query param
-    if not sid and session_id:
-        sid = session_id
-
-    # 3) Tolerancia: intentar leer JSON crudo (Actions a veces manda {})
-    if not sid:
-        try:
-            data = await request.json()
-            if isinstance(data, dict):
-                sid = data.get("session_id")
-        except Exception:
-            pass
-
-    if not sid or not str(sid).strip():
-        return JSONResponse(
-            status_code=422,
-            content={"detail": [{"type": "missing", "loc": ["body", "session_id"], "msg": "Field required", "input": {}}]},
-        )
-
-    p = _session_path(str(sid))
-    if p.exists():
-        p.unlink()
-    return {"ok": True, "session_id": str(sid)}
-
+# -----------------------------
+# Reset sesión (path param - fiable para Actions)
+# -----------------------------
 @app.post("/session/reset/{session_id}")
 def session_reset_path(session_id: str) -> Dict[str, Any]:
     if not session_id or not session_id.strip():
@@ -285,10 +244,31 @@ def session_reset_path(session_id: str) -> Dict[str, Any]:
 
     return {"ok": True, "session_id": session_id}
 
+# -----------------------------
+# Dump sesión (AHORA incluye scene/flags/module_progress)
+# -----------------------------
 @app.get("/session/{session_id}")
 def session_dump(session_id: str) -> Dict[str, Any]:
     p = _session_path(session_id)
     if not p.exists():
-        return {"ok": True, "session_id": session_id, "history": []}
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "history": [],
+            "scene": {},
+            "flags": {},
+            "module_progress": {},
+        }
+
     data = json.loads(p.read_text(encoding="utf-8"))
-    return {"ok": True, "session_id": session_id, "history": data.get("history", [])}
+    if not isinstance(data, dict):
+        data = {}
+
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "history": data.get("history", []) if isinstance(data.get("history", []), list) else [],
+        "scene": data.get("scene", {}) if isinstance(data.get("scene", {}), dict) else {},
+        "flags": data.get("flags", {}) if isinstance(data.get("flags", {}), dict) else {},
+        "module_progress": data.get("module_progress", {}) if isinstance(data.get("module_progress", {}), dict) else {},
+    }
