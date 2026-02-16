@@ -7,6 +7,7 @@ from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 # -----------------------------
@@ -21,7 +22,7 @@ SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 # -----------------------------
 # Token (se evalúa DESPUÉS de load_dotenv)
 # -----------------------------
-PUBLIC_PATHS = {"/health", "/config", "/docs", "/openapi.json", "/redoc"}
+PUBLIC_PATHS = {"/", "/favicon.ico", "/health", "/config", "/docs", "/openapi.json", "/redoc"}
 
 def _get_api_token() -> str:
     # ✅ se lee en runtime (no solo en import) para evitar “token vacío” por orden de carga
@@ -75,11 +76,16 @@ async def require_token(request: Request, call_next):
 
     token = _get_api_token()
     if not token:
-        # fail-closed: si no hay token configurado, no sirvas endpoints “privados”
-        raise HTTPException(status_code=503, detail="Servidor sin DM_API_TOKEN configurado")
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Servidor sin DM_API_TOKEN configurado"},
+        )
 
     if not _auth_ok(request, token):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Unauthorized"},
+        )
 
     return await call_next(request)
 
@@ -150,6 +156,10 @@ def _check_runtime_ready() -> Dict[str, Any]:
 # -----------------------------
 # Endpoints
 # -----------------------------
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return {"ok": True, "service": "Althalus DM Agent API"}
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True, "ready": _check_runtime_ready()}
@@ -166,6 +176,10 @@ def config() -> Dict[str, Any]:
         "sessions_dir": str(SESSIONS_DIR),
         "root": str(ROOT),
     }
+
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status_code=204)
 
 @app.post("/turn", response_model=TurnResponse)
 def turn(req: TurnRequest):
@@ -196,12 +210,15 @@ def turn(req: TurnRequest):
     save_state(req.session_id, state)
     return TurnResponse(session_id=req.session_id, output=str(output))
 
+class SessionResetRequest(BaseModel):
+    session_id: str
+
 @app.post("/session/reset")
-def session_reset(session_id: str) -> Dict[str, Any]:
-    p = _session_path(session_id)
+def session_reset(req: SessionResetRequest) -> Dict[str, Any]:
+    p = _session_path(req.session_id)
     if p.exists():
         p.unlink()
-    return {"ok": True, "session_id": session_id}
+    return {"ok": True, "session_id": req.session_id}
 
 @app.get("/session/{session_id}")
 def session_dump(session_id: str) -> Dict[str, Any]:
