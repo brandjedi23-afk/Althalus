@@ -459,6 +459,13 @@ def tool_canon_patch(json_text: str) -> str:
 
     return "OK. canon.json actualizado (patch aplicado)."
 
+def tool_update_recap(text: str) -> str:
+    st = _ACTIVE_STATE
+    if st is None:
+        return "WARN: no active state"
+    st.scene["recap"] = (text or "").strip()
+    return "OK: recap actualizado"
+
 def _make_item_instance(item_def: dict, *, qty: int = 1) -> dict:
     """
     Crea una instancia de item para inventario/loot.
@@ -2154,6 +2161,7 @@ TOOLS: Dict[str, Callable[..., str]] = {
     "module_query": tool_module_query,
     "module_quote": tool_module_quote,
     "module_set_progress": tool_module_set_progress,
+    "update_recap": tool_update_recap,
 
     "start_scene": tool_start_scene,
     "scene_status": tool_scene_status,
@@ -2254,6 +2262,11 @@ TOOL_SCHEMAS = [
         "scene": {"type": "string"},
         "add_flags_json": {"type": "string"}
     }, []),
+
+    _schema("update_recap", "Actualiza el resumen persistente de la escena (scene.recap) para continuidad sin releer todo el history.",
+        {"text": {"type": "string"}},
+        ["text"]
+    ),
 
     _schema("start_scene", "Inicializa escena en canon.session.", {"location": {"type": "string"}, "hook": {"type": "string"}}, ["location", "hook"]),
     _schema("scene_status", "Devuelve estado de escena (JSON).", {}, []),
@@ -2373,12 +2386,17 @@ MODO ESCENA (CRÍTICO):
 - Para cualquier conjuro (texto, alcance, duración, componentes, etc.), usa spell_info(name). Si dudas del nombre exacto, usa spell_search(query).
 - Tras un hito importante, llama a xp_progress(...) y luego a level_check_up() para ver si subimos de nivel.
 - Tras añadir XP, llama a level_up_announce() para anunciar la subida de nivel.
+
 - MÓDULO (Fidelidad):
   - Si hay un módulo activo, ANTES de describir una escena nueva o resolver una decisión importante, llama a module_query()
     con palabras clave del momento (lugar, PNJ, objetivo, elemento raro) para anclar la narración al texto real.
   - Usa module_quote(chunk_id) SOLO cuando necesites texto literal (read-aloud) o verificación; evita soltar spoilers.
   - No menciones números de sala/encuentro ni claves internas; adapta la presentación al jugador.
   - Tras hitos grandes, actualiza module_set_progress(chapter, scene, flags) para mantener continuidad.
+
+RECAP (OBLIGATORIO):
+- Si has avanzado la escena o cambiado algo relevante, al final del turno llama a update_recap con un resumen de 2–6 líneas:
+  lugar actual, qué acaba de pasar, NPCs relevantes, y qué decisiones quedan abiertas.
 """
 
 # =========================================================
