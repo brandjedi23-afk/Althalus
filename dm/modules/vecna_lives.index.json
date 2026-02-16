@@ -1,0 +1,12 @@
+{
+  "module_id": "vecna_lives",
+  "title": "Vecna Lives!",
+  "chunks": [
+    {
+      "id": "p009_a",
+      "page": 9,
+      "tags": ["prologue", "tone", "circle_of_eight"],
+      "text": "Wherein the Circle of Eight Begins..."
+    }
+  ]
+}

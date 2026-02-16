@@ -1,0 +1,95 @@
+openapi: 3.1.0
+info:
+  title: DM Agent API
+  version: "1.2.0"
+
+servers:
+  - url: https://ubiquitous-space-giggle-r49rgrw5g6qwhv9p-8000.app.github.dev
+
+components:
+  schemas: {}
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-KEY
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /health:
+    get:
+      operationId: health
+      summary: Health check
+      security: []
+      responses:
+        "200":
+          description: OK
+
+  /config:
+    get:
+      operationId: config
+      summary: Runtime config (safe)
+      security: []
+      responses:
+        "200":
+          description: OK
+
+  /turn:
+    post:
+      operationId: turn
+      summary: Run one DM agent turn
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, text]
+              properties:
+                session_id:
+                  type: string
+                text:
+                  type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session_id, output]
+                properties:
+                  session_id:
+                    type: string
+                  output:
+                    type: string
+
+  /session/reset:
+    post:
+      operationId: sessionReset
+      summary: Reset a session
+      parameters:
+        - name: session_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+
+  /session/{session_id}:
+    get:
+      operationId: sessionDump
+      summary: Dump stored session history
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
