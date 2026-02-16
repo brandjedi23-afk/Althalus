@@ -4,7 +4,7 @@ import json
 import re
 import random
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional, Tuple, Callable, Set
 import inspect
 from copy import deepcopy
 from pathlib import Path
@@ -645,6 +645,47 @@ def _get_target_container(canon: dict, target: str) -> Optional[Tuple[str, dict,
             return ("enemy", v, k)
 
     return None
+
+def _ensure_enemy_stub_anywhere(canon: dict, name: str, defaults: dict | None = None) -> bool:
+    """
+    Garantiza que exista canon['enemies'][name]. Útil cuando el LLM narra enemigos
+    sin registrarlos previamente. Devuelve True si existe o se creó.
+    """
+    name = (name or "").strip()
+    if not name:
+        return False
+
+    # Si es PJ, no crear enemigo
+    if _find_party_member(canon, name):
+        return False
+
+    canon.setdefault("enemies", {})
+    enemies = canon["enemies"]
+
+    if name in enemies:
+        # asegurar campos mínimos
+        enemies[name].setdefault("name", name)
+        enemies[name].setdefault("conditions", [])
+        enemies[name].setdefault("ac", 10)
+        enemies[name].setdefault("hp", 999)
+        enemies[name].setdefault("hp_max", enemies[name].get("hp", 999))
+        canon_save(canon)
+        return True
+
+    stub = {
+        "name": name,
+        "stub": True,
+        "ac": 10,
+        "hp": 999,
+        "hp_max": 999,
+        "conditions": [],
+    }
+    if defaults and isinstance(defaults, dict):
+        stub.update({k: v for k, v in defaults.items() if v is not None})
+
+    enemies[name] = stub
+    canon_save(canon)
+    return True
 
 def _ensure_enemy_stub_from_combat(canon: dict, target: str) -> bool:
     """
@@ -1553,6 +1594,11 @@ def tool_skill_check(actor: str, skill: str, dc: int, mode: str = "normal", extr
 def tool_apply_condition(target: str, condition: str, rounds: int = 1) -> str:
     canon = canon_load()
     found = _get_target_container(canon, target)
+    # Auto-stub si no se encuentra (evita bloqueos)
+    if not found:
+        if _ensure_enemy_stub_anywhere(canon, target):
+            canon = canon_load()
+            found = _get_target_container(canon, target)
     if not found:
         return f"No encuentro el objetivo '{target}'."
     _, obj, cname = found
@@ -1590,9 +1636,116 @@ def tool_remove_condition(target: str, condition: str) -> str:
     removed = before - len(obj["conditions"])
     return f"OK. Quitado {name} de {cname}." if removed else f"{cname} no tenía {name}."
 
+def tool_register_enemies(names_json: str) -> str:
+    """
+    Registra enemigos en canon['enemies'] sin necesidad de iniciar combate.
+
+    Entrada (JSON string) aceptada:
+    - ["Cultista A", "Cultista B"]
+    - [{"name":"Cultista A","ac":12,"hp":27}, {"name":"Encapuchado Oscuro","ac":14}]
+    - {"enemies":[...]}  (lista como arriba)
+
+    Devuelve un resumen de creados/actualizados/ignorados.
+    """
+    canon = canon_load()
+
+    try:
+        data = json.loads(names_json) if isinstance(names_json, str) else names_json
+    except Exception as e:
+        return f"Error: names_json no es JSON válido: {e}"
+
+    # Normalizar a lista
+    if isinstance(data, dict) and "enemies" in data:
+        items = data.get("enemies", [])
+    else:
+        items = data
+
+    if not isinstance(items, list):
+        return "Error: names_json debe ser una lista o un objeto {enemies:[...] }."
+
+    canon.setdefault("enemies", {})
+    enemies = canon["enemies"]
+
+    created, updated, ignored = [], [], []
+
+    def _as_int(v, default):
+        try:
+            if v is None:
+                return default
+            return int(v)
+        except Exception:
+            return default
+
+    for it in items:
+        if isinstance(it, str):
+            name = it.strip()
+            payload = {}
+        elif isinstance(it, dict):
+            name = str(it.get("name", "")).strip()
+            payload = it
+        else:
+            ignored.append(str(it))
+            continue
+
+        if not name:
+            ignored.append(str(it))
+            continue
+
+        # No crear enemigo si es PJ/party
+        if _find_party_member(canon, name):
+            ignored.append(f"{name} (es party)")
+            continue
+
+        # Defaults
+        ac = _as_int(payload.get("ac"), 10)
+        hp = _as_int(payload.get("hp"), 999)
+        hp_max = _as_int(payload.get("hp_max"), hp)
+        stub = bool(payload.get("stub", True))
+
+        if name not in enemies:
+            enemies[name] = {
+                "name": name,
+                "stub": stub,
+                "ac": ac,
+                "hp": hp,
+                "hp_max": hp_max,
+                "conditions": [],
+            }
+            created.append(name)
+        else:
+            eobj = enemies[name]
+            eobj.setdefault("name", name)
+            eobj.setdefault("conditions", [])
+            # solo sobreescribe si viene en payload
+            if "ac" in payload:
+                eobj["ac"] = ac
+            if "hp" in payload:
+                eobj["hp"] = hp
+            if "hp_max" in payload:
+                eobj["hp_max"] = hp_max
+            if "stub" in payload:
+                eobj["stub"] = stub
+            updated.append(name)
+
+    canon_save(canon)
+
+    return (
+        "ENEMIES REGISTERED\n"
+        f"created: {created}\n"
+        f"updated: {updated}\n"
+        f"ignored: {ignored}\n"
+        f"total_enemies: {len(enemies)}"
+    )
+
 def tool_target_status(target: str) -> str:
     canon = canon_load()
     found = _get_target_container(canon, target)
+    
+    if not found:
+        if _ensure_enemy_stub_anywhere(canon, target):
+            canon = canon_load()
+            found = _get_target_container(canon, target)
+
     if not found:
         return f"No encuentro el objetivo '{target}'."
     kind, obj, cname = found
@@ -1822,6 +1975,42 @@ def tool_start_combat(combatants_json: str) -> str:
         "bonus_attack_owner": None,
         "pending_reaction": None,
     }
+    # --- REGISTRO AUTOMÁTICO DE ENEMIGOS EN CANON ---
+    canon.setdefault("enemies", {})
+    enemies = canon["enemies"]
+
+    for c in combatants:
+        name = str(c.get("name", "")).strip()
+        side = str(c.get("side", "unknown")).strip().lower()
+        if not name or side == "party":
+            continue
+
+        # permite que el JSON de combatants incluya ac/hp si quieres
+        defaults = {
+            "ac": c.get("ac", 10),
+            "hp": c.get("hp", 999),
+            "hp_max": c.get("hp_max", c.get("hp", 999)),
+            "conditions": [],
+            "stub": bool(c.get("stub", True)),
+        }
+
+        # crea o asegura mínimos
+        if name not in enemies:
+            enemies[name] = {
+                "name": name,
+                "ac": int(defaults["ac"]) if str(defaults["ac"]).isdigit() else 10,
+                "hp": int(defaults["hp"]) if str(defaults["hp"]).isdigit() else 999,
+                "hp_max": int(defaults["hp_max"]) if str(defaults["hp_max"]).isdigit() else 999,
+                "conditions": [],
+                "stub": defaults["stub"],
+            }
+        else:
+            enemies[name].setdefault("name", name)
+            enemies[name].setdefault("conditions", [])
+            enemies[name].setdefault("ac", 10)
+            enemies[name].setdefault("hp", 999)
+            enemies[name].setdefault("hp_max", enemies[name].get("hp", 999))
+
     canon_save(canon)
 
     current = order[0]
@@ -2193,6 +2382,7 @@ TOOLS: Dict[str, Callable[..., str]] = {
 
     "apply_condition": tool_apply_condition,
     "remove_condition": tool_remove_condition,
+    "register_enemies": tool_register_enemies,
     "target_status": tool_target_status,
     "conditions_status": tool_conditions_status,
     "heal": tool_heal,
@@ -2316,6 +2506,7 @@ TOOL_SCHEMAS = [
 
     _schema("apply_condition", "Aplica condición por X rondas.", {"target": {"type": "string"}, "condition": {"type": "string"}, "rounds": {"type": "integer"}}, ["target", "condition"]),
     _schema("remove_condition", "Quita condición.", {"target": {"type": "string"}, "condition": {"type": "string"}}, ["target", "condition"]),
+    _schema("register_enemies", "Registra enemigos en canon['enemies'] a partir de una lista JSON de nombres o de objetos con stats (sin iniciar combate).", {"names_json": {"type": "string", "description": "JSON string: ['Cultista A','Cultista B'] o [{'name':'Cultista A','ac':12,'hp':27}] o {'enemies':[...]}."}}, ["names_json"]),
     _schema("target_status", "Estado de un objetivo.", {"target": {"type": "string"}}, ["target"]),
     _schema("conditions_status", "Lista condiciones activas.", {}, []),
 
@@ -2868,6 +3059,133 @@ def _preprocess_user_text(user_text: str) -> str:
 
     return t3
 
+def _expand_letter_groups(text: str) -> List[str]:
+    """
+    Convierte 'Cultista A/B/C' o 'Cultista A y B' en ['Cultista A','Cultista B','Cultista C'].
+    Heurística pensada para IDs de combate.
+    """
+    out = []
+    # Caso: "Base A/B/C"
+    for m in re.finditer(r"\b([A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ\-']+(?:\s+[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ\-']+)*?)\s+([A-Z](?:/[A-Z])+)\b", text):
+        base = m.group(1).strip()
+        letters = m.group(2).split("/")
+        for L in letters:
+            out.append(f"{base} {L.strip()}")
+
+    # Caso: "Base A y B" / "Base A, B y C"
+    for m in re.finditer(r"\b([A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ\-']+(?:\s+[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ\-']+)*?)\s+([A-Z])(?:\s*,\s*([A-Z]))*(?:\s*(?:y|e)\s*([A-Z]))\b", text, re.IGNORECASE):
+        base = m.group(1).strip()
+        # recolecta letras presentes en grupos 2..4
+        letters = [m.group(2), m.group(3), m.group(4)]
+        for L in letters:
+            if L:
+                out.append(f"{base} {L.strip().upper()}")
+
+    return out
+
+def _extract_probable_enemy_names(text: str) -> List[str]:
+    """
+    Extrae nombres plausibles de enemigos del texto narrativo.
+    Regla principal: etiquetas tipo 'X A', 'X B', etc + nombres en comillas.
+    Evita falsos positivos lo mejor posible sin NLP pesado.
+    """
+    if not text:
+        return []
+
+    names: Set[str] = set()
+
+    # 1) Expandir "A/B/C" y "A y B"
+    for n in _expand_letter_groups(text):
+        names.add(n)
+
+    # 2) Capturar explícitos tipo "Cultista A", "Criatura Oscura B" (Base + letra)
+    for m in re.finditer(r"\b([A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ\-']+(?:\s+[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ\-']+)*?)\s+([A-Z])\b", text):
+        base = m.group(1).strip()
+        letter = m.group(2).strip().upper()
+        # filtro: base con longitud mínima y no demasiado genérico
+        if len(base) >= 4:
+            names.add(f"{base} {letter}")
+
+    # 3) Nombres entre comillas “Encapuchado Oscuro” / "Encapuchado Oscuro"
+    for m in re.finditer(r"[\"“”‘’']([^\"“”‘’']{3,50})[\"“”‘’']", text):
+        candidate = m.group(1).strip()
+        # heurística: que tenga al menos una mayúscula inicial
+        if re.search(r"\b[A-ZÁÉÍÓÚÑ]", candidate):
+            names.add(candidate)
+
+    # 4) Nombres “título” (dos o tres palabras capitalizadas) si aparecen tras palabras gatillo
+    # Ej: "aparecen los Cultistas Sangrientos" / "un Encapuchado Oscuro"
+    for m in re.finditer(r"\b(?:un|una|unos|unas|los|las)\s+([A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ\-']+(?:\s+[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ\-']+){0,3})\b", text):
+        cand = m.group(1).strip()
+        # evita cosas típicas de localización (Greyhawk, Puerto de Greyhawk) usando filtros simples
+        if any(x in cand.lower() for x in ["greyhawk", "puerto", "taberna"]):
+            continue
+        # evita frases demasiado largas
+        if 3 <= len(cand) <= 40:
+            names.add(cand)
+
+    # limpiar y devolver lista estable
+    cleaned = []
+    for n in names:
+        nn = " ".join(n.split()).strip()
+        if nn:
+            cleaned.append(nn)
+
+    return sorted(cleaned)
+
+def _auto_register_enemies_from_output(output_text: str) -> None:
+    """
+    Registra silenciosamente enemigos inferidos del texto narrativo.
+    No escribe mensajes 'tool' en history (para no violar tool_calls).
+    """
+    if not output_text:
+        return
+
+    canon = canon_load()
+    inferred = _extract_probable_enemy_names(output_text)
+
+    if not inferred:
+        return
+
+    # registra solo los que NO sean party
+    to_add = []
+    for name in inferred:
+        if _find_party_member(canon, name):
+            continue
+        to_add.append(name)
+
+    if not to_add:
+        return
+
+    canon.setdefault("enemies", {})
+    enemies = canon["enemies"]
+
+    changed = False
+    for name in to_add:
+        if name not in enemies:
+            enemies[name] = {
+                "name": name,
+                "stub": True,
+                "ac": 10,
+                "hp": 999,
+                "hp_max": 999,
+                "conditions": [],
+            }
+            changed = True
+        else:
+            # asegurar mínimos
+            e = enemies[name]
+            if "conditions" not in e:
+                e["conditions"] = []
+                changed = True
+            e.setdefault("name", name)
+            e.setdefault("ac", 10)
+            e.setdefault("hp", 999)
+            e.setdefault("hp_max", e.get("hp", 999))
+
+    if changed:
+        canon_save(canon)
+
 def run_agent_turn(user_text: str, state: AgentState) -> str:
     """
     Ejecuta un turno del agente.
@@ -2939,6 +3257,7 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
                 has_mech_section = ("RESOLUCIÓN" in text.upper()) or ("MECÁNICA" in text.upper())
 
                 if needs_mechanics and not has_mech_section:
+                    _auto_register_enemies_from_output(text)
                     state.history.append(_assistant_msg(text))
                     state.history.append(_user_msg(
                         "Rehaz la resolución usando herramientas mecánicas: "
@@ -2951,6 +3270,7 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
                         msg2 = resp.choices[0].message
                         text2 = (msg2.content or "").strip()
                         if text2:
+                            _auto_register_enemies_from_output(text2)
                             state.history.append(_assistant_msg(text2))
                             return text2
                     except Exception as e:
