@@ -2665,6 +2665,21 @@ _SPELL_ALIASES = {
     "lightning bolt": "lightning bolt",
 }
 
+def _apply_spell_aliases(text: str) -> Tuple[str, list]:
+    """Normaliza nombres de spells usando aliases y devuelve (texto_nuevo, cambios)."""
+    if not text:
+        return text, []
+    changes = []
+    out = text
+
+    for src, dst in _SPELL_ALIASES.items():
+        pattern = re.compile(rf"\b{re.escape(src)}\b", re.IGNORECASE)
+        if pattern.search(out):
+            out = pattern.sub(dst, out)
+            changes.append((src, dst))
+
+    return out, changes
+
 _TERM_ALIASES = {
     # Feats / shorthand
     "sharp shoot": "sharpshooter",
