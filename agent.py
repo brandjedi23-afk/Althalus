@@ -1645,6 +1645,19 @@ def tool_register_enemies(names_json: str) -> str:
     - [{"name":"Cultista A","ac":12,"hp":27}, {"name":"Encapuchado Oscuro","ac":14}]
     - {"enemies":[...]}  (lista como arriba)
 
+    Además, si vienen estos campos, también los guarda:
+    - role, level, cr
+    - abilities: {str,dex,con,int,wis,cha}
+    - skills: {"Stealth":5,"Perception":3} o lista
+    - saves: {"DEX":4,"WIS":2} o lista
+    - attacks: lista de ataques (texto libre o dicts)
+    - spells: lista de conjuros (strings)
+    - features: lista de rasgos (strings)
+    - tags: lista de etiquetas
+    - notes: texto libre
+    - source: "generated"/"bestiary"/...
+    - stub: bool
+
     Devuelve un resumen de creados/actualizados/ignorados.
     """
     canon = canon_load()
@@ -1672,9 +1685,33 @@ def tool_register_enemies(names_json: str) -> str:
         try:
             if v is None:
                 return default
+            if isinstance(v, bool):
+                return int(v)
             return int(v)
         except Exception:
             return default
+
+    def _as_float(v, default):
+        try:
+            if v is None:
+                return default
+            return float(v)
+        except Exception:
+            return default
+
+    def _as_list(v):
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            s = v.strip()
+            return [s] if s else []
+        # dict u otros -> encapsular
+        return [v]
+
+    def _as_dict(v):
+        return v if isinstance(v, dict) else {}
 
     for it in items:
         if isinstance(it, str):
@@ -1696,11 +1733,39 @@ def tool_register_enemies(names_json: str) -> str:
             ignored.append(f"{name} (es party)")
             continue
 
-        # Defaults
+        # Defaults mínimos
         ac = _as_int(payload.get("ac"), 10)
         hp = _as_int(payload.get("hp"), 999)
         hp_max = _as_int(payload.get("hp_max"), hp)
         stub = bool(payload.get("stub", True))
+
+        # Campos “ricos” opcionales
+        role = payload.get("role")
+        level = payload.get("level")
+        cr = payload.get("cr")
+        abilities = payload.get("abilities")
+        skills = payload.get("skills")
+        saves = payload.get("saves")
+        attacks = payload.get("attacks")
+        spells = payload.get("spells")
+        features = payload.get("features")
+        tags = payload.get("tags")
+        notes = payload.get("notes")
+        source = payload.get("source")
+
+        # Normalizar tipos
+        level_i = _as_int(level, None) if level is not None else None
+        cr_f = _as_float(cr, None) if cr is not None else None
+        abilities_d = _as_dict(abilities)
+        skills_d = skills if isinstance(skills, dict) else (_as_list(skills) if skills is not None else None)
+        saves_d = saves if isinstance(saves, dict) else (_as_list(saves) if saves is not None else None)
+        attacks_l = _as_list(attacks) if attacks is not None else None
+        spells_l = _as_list(spells) if spells is not None else None
+        features_l = _as_list(features) if features is not None else None
+        tags_l = _as_list(tags) if tags is not None else None
+        notes_s = str(notes).strip() if notes is not None else None
+        source_s = str(source).strip() if source is not None else None
+        role_s = str(role).strip() if role is not None else None
 
         if name not in enemies:
             enemies[name] = {
@@ -1711,12 +1776,40 @@ def tool_register_enemies(names_json: str) -> str:
                 "hp_max": hp_max,
                 "conditions": [],
             }
+            # Añadir “ricos” si vienen
+            if role_s is not None:
+                enemies[name]["role"] = role_s
+            if level_i is not None:
+                enemies[name]["level"] = level_i
+            if cr_f is not None:
+                enemies[name]["cr"] = cr_f
+            if abilities_d:
+                enemies[name]["abilities"] = abilities_d
+            if skills_d is not None:
+                enemies[name]["skills"] = skills_d
+            if saves_d is not None:
+                enemies[name]["saves"] = saves_d
+            if attacks_l is not None:
+                enemies[name]["attacks"] = attacks_l
+            if spells_l is not None:
+                enemies[name]["spells"] = spells_l
+            if features_l is not None:
+                enemies[name]["features"] = features_l
+            if tags_l is not None:
+                enemies[name]["tags"] = tags_l
+            if notes_s is not None:
+                enemies[name]["notes"] = notes_s
+            if source_s is not None:
+                enemies[name]["source"] = source_s
+
             created.append(name)
+
         else:
             eobj = enemies[name]
             eobj.setdefault("name", name)
             eobj.setdefault("conditions", [])
-            # solo sobreescribe si viene en payload
+
+            # sobrescribir solo si viene en payload
             if "ac" in payload:
                 eobj["ac"] = ac
             if "hp" in payload:
@@ -1725,6 +1818,32 @@ def tool_register_enemies(names_json: str) -> str:
                 eobj["hp_max"] = hp_max
             if "stub" in payload:
                 eobj["stub"] = stub
+
+            if role_s is not None and "role" in payload:
+                eobj["role"] = role_s
+            if level is not None and "level" in payload:
+                eobj["level"] = level_i
+            if cr is not None and "cr" in payload:
+                eobj["cr"] = cr_f
+            if abilities is not None and "abilities" in payload:
+                eobj["abilities"] = abilities_d
+            if skills is not None and "skills" in payload:
+                eobj["skills"] = skills_d
+            if saves is not None and "saves" in payload:
+                eobj["saves"] = saves_d
+            if attacks is not None and "attacks" in payload:
+                eobj["attacks"] = attacks_l
+            if spells is not None and "spells" in payload:
+                eobj["spells"] = spells_l
+            if features is not None and "features" in payload:
+                eobj["features"] = features_l
+            if tags is not None and "tags" in payload:
+                eobj["tags"] = tags_l
+            if notes is not None and "notes" in payload:
+                eobj["notes"] = notes_s
+            if source is not None and "source" in payload:
+                eobj["source"] = source_s
+
             updated.append(name)
 
     canon_save(canon)
@@ -1736,6 +1855,192 @@ def tool_register_enemies(names_json: str) -> str:
         f"ignored: {ignored}\n"
         f"total_enemies: {len(enemies)}"
     )
+
+def tool_spawn_encounter(encounter_json: str) -> str:
+    """
+    Crea enemigos con stats jugables.
+    - Si encuentra coincidencia en bestiary.json (por name o by_key), importa stats.
+    - Si no, genera stats por role + cr/level.
+
+    Entrada JSON (string):
+    {
+      "enemies": [
+        {"name":"Cultista A","template":"cultist","cr":0.25},
+        {"name":"Cultista B","template":"cultist","cr":0.25},
+        {"name":"Cultista C","template":"cultist","cr":0.25},
+        {"name":"Encapuchado Oscuro","role":"caster","cr":3, "spells":["Hold Person","Magic Missile"]}
+      ]
+    }
+    """
+    try:
+        data = json.loads(encounter_json)
+    except Exception as e:
+        return f"Error: encounter_json no es JSON válido: {e}"
+
+    items = data.get("enemies", data if isinstance(data, list) else None)
+    if not isinstance(items, list):
+        return "Error: encounter_json debe ser lista o {enemies:[...] }"
+
+    canon = canon_load()
+    canon.setdefault("enemies", {})
+    enemies = canon["enemies"]
+
+    # --- cargar bestiary.json una vez ---
+    ROOT = Path(__file__).resolve().parent
+    bestiary_path = ROOT / "dm" / "bestiary.json"
+    bestiary = {}
+    if bestiary_path.exists():
+        try:
+            bestiary = json.loads(bestiary_path.read_text(encoding="utf-8"))
+        except Exception:
+            bestiary = {}
+
+    # Índice simple por nombre (case-insensitive)
+    by_name = {}
+    if isinstance(bestiary, dict):
+        # soporta bestiary dict o list
+        if "monsters" in bestiary and isinstance(bestiary["monsters"], list):
+            src = bestiary["monsters"]
+        elif isinstance(bestiary.get("data"), list):
+            src = bestiary["data"]
+        else:
+            src = None
+        if src:
+            for m in src:
+                n = str(m.get("name", "")).strip()
+                if n:
+                    by_name[n.lower()] = m
+
+    def _as_int(v, default):
+        try:
+            if v is None:
+                return default
+            return int(v)
+        except Exception:
+            return default
+
+    def _hp_for(cr: float, role: str) -> int:
+        # tabla “ligera” (no perfecta) pero estable
+        # base por CR aproximado
+        base = {
+            0: 5, 0.125: 9, 0.25: 13, 0.5: 22, 1: 33, 2: 52, 3: 72, 4: 88, 5: 110,
+            6: 130, 7: 150, 8: 175, 9: 200, 10: 225
+        }
+        # nearest key
+        keys = sorted(base.keys())
+        nearest = min(keys, key=lambda k: abs(k - cr))
+        hp = base[nearest]
+        role = (role or "").lower()
+        if role in {"minion"}:
+            hp = max(1, int(hp * 0.5))
+        elif role in {"brute"}:
+            hp = int(hp * 1.35)
+        elif role in {"boss"}:
+            hp = int(hp * 1.8)
+        return hp
+
+    def _ac_for(cr: float, role: str) -> int:
+        # ligera: sube con CR
+        ac = 11 + int(cr // 2)
+        role = (role or "").lower()
+        if role in {"skirmisher"}:
+            ac += 1
+        if role in {"boss"}:
+            ac += 1
+        return min(20, max(10, ac))
+
+    def _atk_bonus_for(cr: float) -> int:
+        # aprox: CR 0-1 => +3, CR 2-4 => +5, etc.
+        return 3 + int(max(0, cr - 1) // 2) * 2
+
+    def _save_dc_for(cr: float) -> int:
+        # aprox: CR 0-1 => 11-12, CR 3 => 13, CR 5 => 14, etc.
+        return 11 + int(max(0, cr) // 2)
+
+    def _import_from_bestiary(mon: dict, name_override: str) -> dict:
+        # Intenta mapear campos comunes (depende de tu bestiary)
+        ac = mon.get("ac", 10)
+        hp = mon.get("hp", 30)
+        # si hp viene como dict/string, fallback
+        if isinstance(hp, dict):
+            hp = hp.get("average", 30)
+        if isinstance(ac, list) and ac:
+            ac = ac[0].get("ac", 10) if isinstance(ac[0], dict) else ac[0]
+        return {
+            "name": name_override,
+            "stub": False,
+            "ac": _as_int(ac, 10),
+            "hp": _as_int(hp, 30),
+            "hp_max": _as_int(hp, 30),
+            "conditions": [],
+            "source": "bestiary",
+            "raw": mon,  # opcional: guardar statblock entero para herramientas futuras
+        }
+
+    created = []
+    updated = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+
+        name = str(it.get("name", "")).strip()
+        if not name:
+            continue
+
+        # no crear si es party
+        if _find_party_member(canon, name):
+            continue
+
+        # 1) Bestiary match
+        mon = by_name.get(name.lower())
+
+        # 2) Template match (por ejemplo "cultist")
+        template = str(it.get("template", "")).strip().lower()
+        if not mon and template:
+            mon = by_name.get(template.lower())
+
+        if mon:
+            entry = _import_from_bestiary(mon, name)
+        else:
+            # 3) Generate
+            role = str(it.get("role", "") or "").strip().lower() or "skirmisher"
+            cr = it.get("cr")
+            level = it.get("level")
+            try:
+                cr_val = float(cr) if cr is not None else max(0.25, float(level or 1) / 2.0)
+            except Exception:
+                cr_val = 0.25
+
+            ac = _as_int(it.get("ac"), _ac_for(cr_val, role))
+            hp = _as_int(it.get("hp"), _hp_for(cr_val, role))
+            hp_max = _as_int(it.get("hp_max"), hp)
+
+            entry = {
+                "name": name,
+                "stub": False,
+                "role": role,
+                "cr": cr_val,
+                "level": level,
+                "ac": ac,
+                "hp": hp,
+                "hp_max": hp_max,
+                "conditions": [],
+                "atk_bonus": _atk_bonus_for(cr_val),
+                "save_dc": _save_dc_for(cr_val),
+                "spells": it.get("spells", []) or [],
+                "features": it.get("features", []) or [],
+                "source": "generated",
+            }
+
+        if name in enemies:
+            enemies[name].update(entry)
+            updated.append(name)
+        else:
+            enemies[name] = entry
+            created.append(name)
+
+    canon_save(canon)
+    return f"SPAWN_ENCOUNTER OK\ncreated={created}\nupdated={updated}\ntotal_enemies={len(enemies)}"
 
 def tool_target_status(target: str) -> str:
     canon = canon_load()
@@ -2383,6 +2688,7 @@ TOOLS: Dict[str, Callable[..., str]] = {
     "apply_condition": tool_apply_condition,
     "remove_condition": tool_remove_condition,
     "register_enemies": tool_register_enemies,
+    "spawn_encounter": tool_spawn_encounter,
     "target_status": tool_target_status,
     "conditions_status": tool_conditions_status,
     "heal": tool_heal,
@@ -2507,6 +2813,7 @@ TOOL_SCHEMAS = [
     _schema("apply_condition", "Aplica condición por X rondas.", {"target": {"type": "string"}, "condition": {"type": "string"}, "rounds": {"type": "integer"}}, ["target", "condition"]),
     _schema("remove_condition", "Quita condición.", {"target": {"type": "string"}, "condition": {"type": "string"}}, ["target", "condition"]),
     _schema("register_enemies", "Registra enemigos en canon['enemies'] a partir de una lista JSON de nombres o de objetos con stats (sin iniciar combate).", {"names_json": {"type": "string", "description": "JSON string: ['Cultista A','Cultista B'] o [{'name':'Cultista A','ac':12,'hp':27}] o {'enemies':[...]}."}}, ["names_json"]),
+    _schema("spawn_encounter", "Crea enemigos con stats (bestiary si coincide; si no, genera por role+CR/nivel).", {"encounter_json": {"type":"string"}}, ["encounter_json"]),
     _schema("target_status", "Estado de un objetivo.", {"target": {"type": "string"}}, ["target"]),
     _schema("conditions_status", "Lista condiciones activas.", {}, []),
 
