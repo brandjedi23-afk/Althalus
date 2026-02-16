@@ -2107,20 +2107,438 @@ def tool_heal(target: str, amount: int) -> str:
 
 def tool_damage(target: str, amount: int) -> str:
     canon = canon_load()
-    m = _find_party_member(canon, target)
-    if not m:
-        return f"Objetivo '{target}' no es un PJ."
     amount = int(amount)
     if amount <= 0:
         return "amount debe ser > 0"
-    hp = int(m.get("hp", 0))
-    new_hp = max(0, hp - amount)
-    m["hp"] = new_hp
-    if new_hp == 0:
-        m["stable"] = False
+
+    # 1) Party
+    m = _find_party_member(canon, target)
+    if m:
+        hp = int(m.get("hp", 0))
+        new_hp = max(0, hp - amount)
+        m["hp"] = new_hp
+        if new_hp == 0:
+            m["stable"] = False
+        canon_save(canon)
+        status = "INCONSCIENTE (inestable)" if new_hp == 0 else "OK"
+        return f"Daño: {m.get('name')} {hp} → {new_hp} ({status})"
+
+    # 2) Enemy
+    fe = _find_enemy(canon, target)
+    if not fe:
+        # intenta resolver por contenedor (strip comillas, fuzzy, bestiary autospawn, etc.)
+        found = _get_target_container(canon, target)
+        if found and found[0] == "enemy":
+            enemy_name = found[2]
+            enemy_obj = found[1]
+        else:
+            return f"Objetivo '{target}' no existe como PJ ni como enemigo."
+    else:
+        enemy_name, enemy_obj = fe
+
+    # Runtime HP unificado: hp_current/max_hp si existen, si no hp/hp_max
+    if "hp_current" in enemy_obj:
+        hp = int(enemy_obj.get("hp_current", 0) or 0)
+        new_hp = max(0, hp - amount)
+        enemy_obj["hp_current"] = new_hp
+        max_hp = int(enemy_obj.get("max_hp", hp) or hp)
+    else:
+        hp = int(enemy_obj.get("hp", 0) or 0)
+        new_hp = max(0, hp - amount)
+        enemy_obj["hp"] = new_hp
+        max_hp = int(enemy_obj.get("hp_max", hp) or hp)
+
+    killed = (new_hp <= 0)
+
+    # si muere en combate, quitar de orden
+    combat = canon.get("combat", {}) or {}
+    if killed and combat.get("active"):
+        order = combat.get("order", []) or []
+        combat["order"] = [o for o in order if _norm(o.get("name","")) != _norm(enemy_name)]
+        canon["combat"] = combat
+
     canon_save(canon)
-    status = "INCONSCIENTE (inestable)" if new_hp == 0 else "OK"
-    return f"Daño: {m.get('name')} {hp} → {new_hp} ({status})"
+    return f"Daño: {enemy_name} {hp}/{max_hp} → {new_hp}/{max_hp}" + (" (DERROTADO)" if killed else "")
+
+def tool_execute_actions(script: str, default_target: str = "") -> str:
+    canon = canon_load()
+    party = (canon.get("party") or {})
+    members = party.get("members") or []
+    enemies = canon.get("enemies", {}) or {}
+
+    def _norm(s: str) -> str:
+        return (s or "").strip().lower()
+
+    def _first_alive_enemy() -> str:
+        for name, obj in enemies.items():
+            hp = obj.get("hp_current", obj.get("hp", 0))
+            try:
+                if int(hp) > 0:
+                    return name
+            except Exception:
+                continue
+        return ""
+
+    def _find_member(name: str) -> dict:
+        nn = _norm(name)
+        for m in members:
+            if _norm(m.get("name", "")) == nn:
+                return m
+        return {}
+
+    def _ability_mod(score) -> int:
+        try:
+            s = int(score)
+        except Exception:
+            s = 10
+        return (s - 10) // 2
+
+    def _equipped(member: dict) -> list:
+        inv = member.get("inventory") or []
+        return [it for it in inv if isinstance(it, dict) and it.get("equipped")]
+
+    def _get_prof(member: dict) -> int:
+        try:
+            return int(member.get("prof_bonus", 0) or 0)
+        except Exception:
+            return 0
+
+    def _weapon_bonus(item: dict) -> int:
+        try:
+            return int(item.get("bonus", 0) or 0)
+        except Exception:
+            return 0
+
+    def _is_focus_cd_attack(item: dict) -> bool:
+        n = _norm(item.get("name", ""))
+        return ("cd/attack" in n) or ("cd/ataque" in n) or ("spell attack" in n)
+
+    # ---- NUEVO: leer Sneak Attack del canon (p.ej. "Sneak Attack (3d6)") ----
+    def _get_sneak_dice(member: dict) -> str:
+        feats = member.get("features") or []
+        for f in feats:
+            s = str(f)
+            m = re.search(r"Sneak\s*Attack\s*\((\d+d\d+)\)", s, re.IGNORECASE)
+            if m:
+                return m.group(1)
+        # fallback razonable
+        return "3d6"
+
+    # ---- NUEVO: aplicar daño directo a enemigo (porque no hay tool_damage_enemy) ----
+    def _apply_enemy_damage(enemy_name: str, amount: int) -> str:
+        c = canon_load()
+        e = (c.get("enemies", {}) or {}).get(enemy_name)
+        if not e:
+            return f"(WARN) No existe enemigo '{enemy_name}' para aplicar Sneak Attack."
+
+        amount = int(amount)
+        if amount <= 0:
+            return "(WARN) Sneak Attack amount inválido."
+
+        if "hp_current" in e:
+            hp0 = int(e.get("hp_current", 0) or 0)
+            hp1 = max(0, hp0 - amount)
+            e["hp_current"] = hp1
+        else:
+            hp0 = int(e.get("hp", 0) or 0)
+            hp1 = max(0, hp0 - amount)
+            e["hp"] = hp1
+
+        killed = (hp1 <= 0)
+
+        # XP si mata (igual que tool_attack)
+        if killed:
+            cr = e.get("cr")
+            xp_val = _xp_for_cr(cr)
+            if xp_val > 0:
+                _add_xp_to_party(c, xp_val, reason=f"KILL:{enemy_name} (Sneak Attack)", meta={"cr": cr})
+
+        canon_save(c)
+        if killed:
+            return f"SNEAK ATTACK: daño {amount}. HP {enemy_name}: {hp0} → {hp1}. (MUERTE)"
+        return f"SNEAK ATTACK: daño {amount}. HP {enemy_name}: {hp0} → {hp1}."
+
+    # ---- NUEVO: parse de arma forzada: Actor (xxx) ----
+    def _parse_forced_actor(actor_token: str) -> tuple[str, str]:
+        m = re.match(r"^(.+?)\s*\((.+?)\)\s*$", actor_token.strip())
+        if not m:
+            return actor_token.strip(), ""
+        return m.group(1).strip(), _norm(m.group(2))
+
+    def _pick_weapon(member: dict, attack_type: str, forced: str = "") -> dict:
+        eq = _equipped(member)
+        if not eq:
+            return {}
+
+        def nm(it): return _norm(it.get("name", ""))
+
+        if forced:
+            forced_map = {
+                "arco": ["arco", "bow", "longbow", "shortbow"],
+                "bow": ["arco", "bow", "longbow", "shortbow"],
+                "estoque": ["estoque", "rapier"],
+                "rapier": ["estoque", "rapier"],
+                "alabarda": ["alabarda", "halberd"],
+                "halberd": ["alabarda", "halberd"],
+                "martillo": ["martillo", "warhammer"],
+                "warhammer": ["martillo", "warhammer"],
+                "bastón": ["bastón", "staff", "quarterstaff"],
+                "staff": ["bastón", "staff", "quarterstaff"],
+                "melee": ["alabarda", "halberd", "estoque", "rapier", "martillo", "warhammer", "bastón", "staff"],
+                "ranged": ["arco", "bow", "ballesta", "crossbow"],
+            }
+            keys = forced_map.get(forced, [forced])
+            for it in eq:
+                n = nm(it)
+                if any(k in n for k in keys):
+                    return it
+
+        if attack_type == "ranged":
+            for it in eq:
+                n = nm(it)
+                if "arco" in n or "bow" in n or "ballesta" in n or "crossbow" in n:
+                    return it
+            return eq[0]
+
+        for it in eq:
+            n = nm(it)
+            if "alabarda" in n or "halberd" in n or "glaive" in n or "guja" in n:
+                return it
+        for it in eq:
+            n = nm(it)
+            if "estoque" in n or "rapier" in n:
+                return it
+        for it in eq:
+            n = nm(it)
+            if "martillo" in n or "warhammer" in n or "maza" in n or "mace" in n:
+                return it
+        for it in eq:
+            n = nm(it)
+            if "bastón" in n or "staff" in n or "quarterstaff" in n:
+                return it
+
+        return eq[0]
+
+    def _weapon_damage_die(item: dict, attack_type: str) -> tuple[str, bool, bool]:
+        name = _norm(item.get("name", ""))
+
+        if "arco largo" in name or "longbow" in name:
+            return ("1d8", False, False)
+        if "arco corto" in name or "shortbow" in name:
+            return ("1d6", False, False)
+        if "ballesta" in name or "crossbow" in name:
+            return ("1d8", False, False)
+
+        if "alabarda" in name or "halberd" in name:
+            return ("1d10", False, True)
+        if "guja" in name or "glaive" in name:
+            return ("1d10", False, True)
+        if "estoque" in name or "rapier" in name:
+            return ("1d8", True, False)
+        if "espada corta" in name or "shortsword" in name:
+            return ("1d6", True, False)
+        if "martillo de guerra" in name or "warhammer" in name:
+            return ("1d8", False, False)
+        if "bastón" in name or "staff" in name or "quarterstaff" in name:
+            return ("1d6", False, False)
+
+        return ("1d8", False, False)
+
+    def _attack_stat_mod(member: dict, finesse: bool, attack_type: str) -> int:
+        ab = member.get("abilities", {}) or {}
+        str_mod = _ability_mod(ab.get("str", 10))
+        dex_mod = _ability_mod(ab.get("dex", 10))
+        if attack_type == "ranged":
+            return dex_mod
+        return max(dex_mod, str_mod) if finesse else str_mod
+
+    def _spell_attack_bonus(member: dict) -> int:
+        classes = member.get("classes") or []
+        main = ""
+        main_lvl = -1
+        for c in classes:
+            try:
+                lvl = int(c.get("level", 0) or 0)
+            except Exception:
+                lvl = 0
+            if lvl > main_lvl:
+                main_lvl = lvl
+                main = _norm(c.get("name", ""))
+
+        ab = member.get("abilities", {}) or {}
+        if main in {"wizard", "artificer"}:
+            stat_mod = _ability_mod(ab.get("int", 10))
+        elif main in {"cleric", "druid", "ranger"}:
+            stat_mod = _ability_mod(ab.get("wis", 10))
+        elif main in {"paladin", "sorcerer", "warlock", "bard"}:
+            stat_mod = _ability_mod(ab.get("cha", 10))
+        else:
+            stat_mod = _ability_mod(ab.get("int", 10))
+
+        focus_bonus = 0
+        for it in _equipped(member):
+            if _is_focus_cd_attack(it):
+                focus_bonus = max(focus_bonus, _weapon_bonus(it))
+
+        return _get_prof(member) + stat_mod + focus_bonus
+
+    def _fire_bolt_damage(member: dict) -> str:
+        try:
+            lvl = int(member.get("total_level", 1) or 1)
+        except Exception:
+            lvl = 1
+        if lvl >= 17:
+            return "4d10"
+        if lvl >= 11:
+            return "3d10"
+        if lvl >= 5:
+            return "2d10"
+        return "1d10"
+
+    tgt = default_target.strip() or _first_alive_enemy()
+    if not tgt:
+        return "No hay enemigos vivos registrados para ejecutar acciones."
+
+    parts = [p.strip() for p in re.split(r"[.\n]+", script) if p.strip()]
+    out_lines = ["EXECUTE_ACTIONS"]
+
+    # ---- NUEVO: SA se aplica una vez por actor por llamada a tool_execute_actions ----
+    sa_used_by_actor = {}
+
+    for p in parts:
+        m = re.match(r"^([A-Za-zÁÉÍÓÚÑáéíóúñ0-9_\-\(\)\s]+)\s+(.*)$", p)
+        if not m:
+            continue
+
+        actor_token = m.group(1).strip()
+        rest_raw = m.group(2).strip()
+        rest = rest_raw.lower()
+
+        actor, forced_weapon = _parse_forced_actor(actor_token)
+        member = _find_member(actor)
+
+        n = 1
+        mn = re.search(r"(\d+)\s+(disparos|ataques|ataque)", rest)
+        if mn:
+            n = max(1, int(mn.group(1)))
+
+        use_ss = ("sharpshooter" in rest) or ("sharp shooter" in rest)
+        use_gwm = ("gwm" in rest) or ("great weapon master" in rest) or ("great weapon mastery" in rest)
+        use_pam = ("pam" in rest) or ("polearm mastery" in rest) or ("maestro de armas de asta" in rest)
+
+        # ---- NUEVO: detecta Sneak Attack en la línea ----
+        wants_sa = ("sneak attack" in rest) or ("ataque furtivo" in rest)
+
+        attack_type = "ranged" if ("disparo" in rest or "ranged" in rest or use_ss) else "melee"
+        if "mele" in rest or "melee" in rest:
+            attack_type = "melee"
+
+        if "fire bolt" in rest:
+            if not member:
+                out_lines.append(f"\n[{actor}] Fire Bolt → {tgt}")
+                out_lines.append(tool_attack(attacker=actor, target=tgt, bonus=0, damage="1d10", attack_type="ranged"))
+                continue
+
+            atk_bonus = _spell_attack_bonus(member)
+            dmg = _fire_bolt_damage(member)
+            out_lines.append(f"\n[{actor}] Fire Bolt → {tgt} (atk+{atk_bonus}, dmg {dmg})")
+            out_lines.append(
+                tool_attack(
+                    attacker=actor,
+                    target=tgt,
+                    bonus=atk_bonus,
+                    damage=dmg,
+                    attack_type="ranged",
+                    auto_power=False
+                )
+            )
+            continue
+
+        # ataques con arma
+        if not member:
+            out_lines.append(f"\n[{actor}] x{n} {attack_type} → {tgt}")
+            for _ in range(n):
+                out_lines.append(
+                    tool_attack(
+                        attacker=actor,
+                        target=tgt,
+                        bonus=0,
+                        damage="1d8",
+                        attack_type=attack_type,
+                        power_shot=use_ss,
+                        power_attack=use_gwm,
+                        auto_power=True
+                    )
+                )
+            continue
+
+        weapon = _pick_weapon(member, attack_type, forced=forced_weapon)
+        die, finesse, heavy = _weapon_damage_die(weapon, attack_type)
+        w_bonus = _weapon_bonus(weapon)
+
+        stat_mod = _attack_stat_mod(member, finesse=finesse, attack_type=attack_type)
+        prof = _get_prof(member)
+
+        atk_bonus = prof + stat_mod + w_bonus
+        dmg_mod = stat_mod + w_bonus
+        dmg = f"{die}+{dmg_mod}" if dmg_mod != 0 else die
+
+        out_lines.append(
+            f"\n[{actor}] x{n} {attack_type} → {tgt} (atk+{atk_bonus}, dmg {dmg})"
+            + (f" [weapon:{weapon.get('name','?')}]" if weapon else "")
+            + (" (SS)" if use_ss else "")
+            + (" (GWM)" if use_gwm else "")
+            + (" (PAM)" if use_pam else "")
+            + (" (SA)" if wants_sa else "")
+        )
+
+        # ataques principales
+        for _ in range(n):
+            res = tool_attack(
+                attacker=actor,
+                target=tgt,
+                bonus=atk_bonus,
+                damage=dmg,
+                attack_type=attack_type,
+                power_shot=use_ss,
+                power_attack=use_gwm,
+                auto_power=True
+            )
+            out_lines.append(res)
+
+            # ---- NUEVO: aplica Sneak Attack al primer IMPACTO (una vez por actor) ----
+            if wants_sa and not sa_used_by_actor.get(actor, False):
+                # hit si contiene "Impacto" y no contiene "Resultado: FALLO"
+                if ("Impacto" in res) and ("Resultado: FALLO" not in res):
+                    sa_dice = _get_sneak_dice(member)  # e.g. "3d6"
+                    roll_txt = tool_roll(sa_dice)
+                    mtotal = re.search(r"total\s*=\s*(\d+)", roll_txt)
+                    sa_amt = int(mtotal.group(1)) if mtotal else 0
+
+                    out_lines.append(f"[{actor}] Sneak Attack extra roll: {roll_txt}")
+                    out_lines.append(_apply_enemy_damage(tgt, sa_amt))
+
+                    sa_used_by_actor[actor] = True
+
+        # PAM bonus attack 1d4
+        if use_pam and attack_type == "melee":
+            wname = _norm(weapon.get("name", "")) if weapon else ""
+            pam_ok = ("alabarda" in wname) or ("halberd" in wname) or ("guja" in wname) or ("glaive" in wname)
+            if pam_ok:
+                pam_dmg = f"1d4+{dmg_mod}" if dmg_mod != 0 else "1d4"
+                out_lines.append(f"[{actor}] PAM bonus attack → {tgt} (atk+{atk_bonus}, dmg {pam_dmg})")
+                out_lines.append(
+                    tool_attack(
+                        attacker=actor,
+                        target=tgt,
+                        bonus=atk_bonus,
+                        damage=pam_dmg,
+                        attack_type="melee",
+                        auto_power=False
+                    )
+                )
+
+    return "\n".join(out_lines)
 
 def tool_stabilize(target: str) -> str:
     canon = canon_load()
@@ -2693,6 +3111,7 @@ TOOLS: Dict[str, Callable[..., str]] = {
     "conditions_status": tool_conditions_status,
     "heal": tool_heal,
     "damage": tool_damage,
+    "execute_actions": tool_execute_actions,
     "stabilize": tool_stabilize,
     "rest": tool_rest,
 
@@ -2819,6 +3238,7 @@ TOOL_SCHEMAS = [
 
     _schema("heal", "Cura a un PJ.", {"target": {"type": "string"}, "amount": {"type": "integer"}}, ["target", "amount"]),
     _schema("damage", "Aplica daño a un PJ.", {"target": {"type": "string"}, "amount": {"type": "integer"}}, ["target", "amount"]),
+    _schema("execute_actions", "Ejecuta múltiples acciones en cadena (multiataques / disparos / cantrips) a partir de un texto.", {"script": {"type": "string"}, "default_target": {"type": "string"}}, ["script"]),
     _schema("stabilize", "Estabiliza PJ a 0 HP.", {"target": {"type": "string"}}, ["target"]),
     _schema("rest", "Descanso short/long.", {"kind": {"type": "string"}}, []),
 
