@@ -637,7 +637,54 @@ def _get_target_container(canon: dict, target: str) -> Optional[Tuple[str, dict,
         k, v = spawned
         return ("enemy", v, k)
 
+    # 4) Si hay combate activo y el objetivo está en iniciativa, crea stub
+    if _ensure_enemy_stub_from_combat(canon, target):
+        fe2 = _find_enemy(canon, target)
+        if fe2:
+            k, v = fe2
+            return ("enemy", v, k)
+
     return None
+
+def _ensure_enemy_stub_from_combat(canon: dict, target: str) -> bool:
+    """
+    Si hay combate activo y el target está en la iniciativa con side != party,
+    crea un enemigo stub en canon['enemies'] para permitir ataques/condiciones.
+    """
+    combat = canon.get("combat", {}) or {}
+    if not combat.get("active"):
+        return False
+
+    order = combat.get("order", []) or []
+    t_norm = (target or "").strip().lower()
+
+    # buscar en iniciativa
+    for o in order:
+        name = str(o.get("name", "")).strip()
+        side = str(o.get("side", "")).strip().lower()
+        if not name:
+            continue
+        if name.lower() == t_norm and side != "party":
+            canon.setdefault("enemies", {})
+            enemies = canon["enemies"]
+
+            # si ya existe, ok
+            if name in enemies:
+                return True
+
+            # crear stub (valores por defecto + marca)
+            enemies[name] = {
+                "name": name,
+                "stub": True,
+                "ac": 10,
+                "hp": 999,
+                "hp_max": 999,
+                "conditions": [],
+            }
+            canon_save(canon)
+            return True
+
+    return False
 
 def _unique_enemy_instance_name(canon: dict, base_name: str) -> str:
     enemies = canon.get("enemies", {}) or {}
@@ -1974,15 +2021,27 @@ def tool_attack(
     power_shot: bool = False,
     power_attack: bool = False,
     auto_power: bool = True,
-    crit_range: int = 20
+    crit_range: int = 20,
+    mode: str = "auto"  # auto|normal|adv|dis
 ) -> str:
     attack_type = (attack_type or "melee").lower()
     if attack_type not in {"melee", "ranged"}:
         return "attack_type debe ser 'melee' o 'ranged'"
 
+    mode = (mode or "auto").lower()
+    if mode not in {"auto", "normal", "adv", "dis"}:
+        return "mode debe ser 'auto', 'normal', 'adv' o 'dis'"
+
     canon = canon_load()
     found_a = _get_target_container(canon, attacker)
     found_t = _get_target_container(canon, target)
+
+    # si target no existe pero está en combate, crea stub y reintenta
+    if not found_t:
+        _ensure_enemy_stub_from_combat(canon, target)
+        canon = canon_load()
+        found_t = _get_target_container(canon, target)
+
     if not found_a:
         return f"No encuentro atacante '{attacker}'."
     if not found_t or found_t[0] != "enemy":
@@ -1991,128 +2050,82 @@ def tool_attack(
     _, attacker_obj, attacker_name = found_a
     _, target_obj, target_name = found_t
 
-    cover = (canon.get("cover", {}) or {}).get(target_name, "none")
-    cb = _cover_bonus(cover)
-    if cb >= 999:
-        return f"{target_name} tiene cobertura TOTAL. No puede ser atacado."
+    # condiciones del objetivo
+    conds = _ensure_conditions(target_obj)
+    cond_names = {str(c.get("name", "")).lower() for c in conds}
 
-    base_ac = int(target_obj.get("ac", 10))
-    target_ac = base_ac + cb
+    # calcular adv/dis automático si mode=auto
+    auto_mode = "normal"
+    notes = []
 
-    mode = "normal"
-    if _has_condition(target_obj, "PRONE"):
-        mode = "adv" if attack_type == "melee" else "dis"
-
-    if attack_type == "melee":
-        rng = tool_get_range(attacker_name, target_name)
-        if rng != "melee":
-            return f"No estás en melee con {target_name}. Usa approach() o set_range()."
-
-    dmg_bonus = 0
-    atk_bonus = int(bonus)
-
-    if power_shot and attack_type == "ranged":
-        atk_bonus -= 5
-        dmg_bonus += 10
-
-    use_power_attack = False
-    if attack_type == "melee":
-        if power_attack:
-            use_power_attack = True
-        elif auto_power:
-            base_avg = _avg_damage(damage)
-            p_base = _hit_prob(target_ac, atk_bonus, mode)
-            p_pow = _hit_prob(target_ac, atk_bonus - 5, mode)
-            ev_base = p_base * base_avg
-            ev_pow = p_pow * (base_avg + 10)
-            use_power_attack = ev_pow > ev_base
-
-    if use_power_attack:
-        atk_bonus -= 5
-        dmg_bonus += 10
-
-    roll = random.randint(1, 20)
-    total = roll + atk_bonus
-
-    # Reglas base d20:
-    # - 1 natural = fallo automático
-    # - 20 natural = acierto automático y crítico (en este motor)
-    if roll == 1:
-        hit = False
-        crit = False
+    if mode == "auto":
+        # PARALYZED => ventaja
+        if "paralyzed" in cond_names:
+            auto_mode = "adv"
+            notes.append("AUTO: target PARALYZED => ADV")
+        # PRONE => melee adv, ranged dis
+        if "prone" in cond_names:
+            if attack_type == "melee":
+                auto_mode = "adv"
+                notes.append("AUTO: target PRONE + melee => ADV")
+            else:
+                auto_mode = "dis"
+                notes.append("AUTO: target PRONE + ranged => DIS")
+        mode_use = auto_mode
     else:
-        hit = (roll == 20) or (total >= target_ac)
-        crit = hit and ((roll == 20) or (roll >= int(crit_range)))
+        mode_use = mode
 
-    log = [
-        f"{attacker_name} ataca a {target_name} ({attack_type})",
-        f"Tirada: d20={roll} + {atk_bonus} = {total} vs CA {target_ac} (base {base_ac} + cover {cover})"
-    ]
+    # tirar d20 (visible)
+    r1 = random.randint(1, 20)
+    r2 = random.randint(1, 20) if mode_use in {"adv", "dis"} else None
 
-    if not hit:
-        canon_save(canon)
-        return "\n".join(log + ["Resultado: FALLO"])
+    chosen = r1
+    if r2 is not None:
+        chosen = max(r1, r2) if mode_use == "adv" else min(r1, r2)
 
-    base = tool_roll(damage)
-    try:
-        dmg = int(base.split("total=")[-1])
-    except Exception:
-        dmg = 0
+    total = chosen + int(bonus)
 
-    if crit:
-        extra = tool_roll(damage)
-        try:
-            dmg += int(extra.split("total=")[-1])
-        except Exception:
-            pass
+    # AC (si es stub, será 10 por defecto)
+    ac = int(target_obj.get("ac", 10))
 
-    dmg += dmg_bonus
+    # crit check
+    is_crit = chosen >= int(crit_range)
 
-    # hp runtime
-    if "hp_current" in target_obj:
-        target_hp = int(target_obj.get("hp_current", 0) or 0)
-        new_hp = max(0, target_hp - dmg)
-        target_obj["hp_current"] = new_hp
+    # PARALYZED: si impacta en melee normalmente es crit automático a 5 ft; no tenemos distancia,
+    # pero por defecto, si attack_type==melee y target PARALYZED, marcamos "crit_on_hit" informativo.
+    crit_on_hit = False
+    if attack_type == "melee" and "paralyzed" in cond_names:
+        crit_on_hit = True
+        notes.append("PARALYZED: si estás a 5 ft, el golpe es CRIT al impactar (regla 5e).")
+
+    hit = total >= ac
+
+    # daño (visible) -> reutiliza tool_roll para mostrar tiradas
+    dmg_out = tool_roll(damage)
+    # si crítico (o crit_on_hit y hit), duplicar dados: forma simple -> volver a tirar el mismo daño una vez más
+    if hit and (is_crit or crit_on_hit):
+        dmg_out_crit = tool_roll(damage)
+        dmg_out = f"{dmg_out}\nCRIT extra:\n{dmg_out_crit}"
+
+    # construir salida
+    lines = []
+    lines.append(f"ATAQUE: {attacker_name} -> {target_name} ({attack_type})")
+    lines.append(f"MODE: {mode_use}")
+    if r2 is None:
+        lines.append(f"d20: {r1} + bonus {bonus} = {total}")
     else:
-        try:
-            target_hp = int(target_obj.get("hp", 0) or 0)
-        except Exception:
-            target_hp = 0
-        new_hp = max(0, target_hp - dmg)
-        target_obj["hp"] = new_hp
+        lines.append(f"d20: {r1}, {r2} -> elegido {chosen} + bonus {bonus} = {total}")
 
-    killed = (new_hp <= 0)
+    lines.append(f"AC objetivo: {ac}" + (" (STUB)" if target_obj.get("stub") else ""))
+    lines.append("RESULTADO: IMPACTA" if hit else "RESULTADO: FALLA")
 
-    if killed:
-        # XP por kill automático
-        cr = target_obj.get("cr")
-        xp_val = _xp_for_cr(cr)
-        if xp_val > 0:
-            _add_xp_to_party(canon, xp_val, reason=f"KILL:{target_name}", meta={"cr": cr})
-            log.append(f"XP: +{xp_val} (CR {cr}) al grupo")
+    if notes:
+        lines.append("NOTAS: " + " | ".join(notes))
 
-    if power_shot and attack_type == "ranged":
-        log.append("Power Shot (SS-style): -5 al ataque, +10 al daño")
-    if use_power_attack and attack_type == "melee":
-        log.append("Power Attack (GWM-style): -5 al ataque, +10 al daño")
+    if hit:
+        lines.append("DAÑO:\n" + str(dmg_out))
 
-    log.append(f"Impacto{' CRÍTICO' if crit else ''}: daño {dmg}")
-    log.append(f"HP de {target_name}: {target_hp} → {new_hp}")
-
-    combat = canon.get("combat", {}) or {}
-    if combat.get("active") and attack_type == "melee" and (crit or killed):
-        combat["bonus_attack_available"] = True
-        combat["bonus_attack_owner"] = attacker_name
-        canon["combat"] = combat
-        log.append("Ataque extra (Bonus Action) DISPONIBLE por crítico/muerte")
-
-    if killed and (canon.get("combat", {}) or {}).get("active"):
-        order = canon["combat"].get("order", []) or []
-        canon["combat"]["order"] = [o for o in order if o.get("name") != target_name]
-        log.append(f"{target_name} cae derrotado.")
-
-    canon_save(canon)
-    return "\n".join(log)
+    return "\n".join(lines)
 
 def tool_bonus_attack(attacker: str, target: str, bonus: int, damage: str = "1d8") -> str:
     canon = canon_load()
@@ -2921,12 +2934,17 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
             # 3) Sin tools: devuelve texto final
             text = (msg.content or "").strip()
             if text:
-                # Si el modelo se “auto-bloquea” por combate, forzamos un retry 1 vez en modo escena
-                if re.search(r"no hay un combate activo", text, re.IGNORECASE):
+                # Si el modelo describe impactos/daño/condiciones sin tools, forzamos 1 retry pidiendo tiradas visibles
+                needs_mechanics = bool(re.search(r"\b(impacta|falla|daño|d20|tirada|crítico|crit|prone|paralyzed|paralizado|derribado)\b", text, re.IGNORECASE))
+                has_mech_section = ("RESOLUCIÓN" in text.upper()) or ("MECÁNICA" in text.upper())
+
+                if needs_mechanics and not has_mech_section:
                     state.history.append(_assistant_msg(text))
                     state.history.append(_user_msg(
-                        "Continúa en MODO ESCENA (sin combate): describe la situación actual, mantén continuidad, "
-                        "da 2–4 opciones accionables. No te bloquees por falta de combate."
+                        "Rehaz la resolución usando herramientas mecánicas: "
+                        "para ataques usa tool_attack (una vez por ataque), "
+                        "para daño usa tool_roll, y para condiciones usa tool_apply_condition/target_status. "
+                        "Incluye SIEMPRE una sección RESOLUCIÓN (mecánica) pegando el output literal de las tools."
                     ))
                     try:
                         resp = _call_chat_with_retries(state.history)
@@ -2936,7 +2954,7 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
                             state.history.append(_assistant_msg(text2))
                             return text2
                     except Exception as e:
-                        return f"Error llamando al modelo tras retry modo escena: {e}"
+                        return f"Error llamando al modelo tras retry tiradas visibles: {e}"
 
                 state.history.append(_assistant_msg(text))
                 return text
