@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Si no viene PORT (Railway lo pone), usa 8000 por defecto
-PORT="${PORT:-8000}"
+echo "=== Althalus boot ==="
+echo "PWD=$(pwd)"
+echo "PORT=${PORT:-<unset>}"
+echo "PYTHON=$(which python || true)"
+echo "UVICORN=$(which uvicorn || true)"
+ls -la
 
-# Arranca FastAPI
-exec uvicorn server:app --host 0.0.0.0 --port "$PORT"
+exec uvicorn server:app --host 0.0.0.0 --port "${PORT:-8000}"

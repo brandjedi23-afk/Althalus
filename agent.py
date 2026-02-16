@@ -2642,6 +2642,142 @@ def _normalize_history_for_chat(history: list) -> list:
 
     return out
 
+import re
+from typing import Tuple
+
+# =========================================================
+# Gameplay patch: menos literal (movimiento implícito, NPCs, aliases)
+# =========================================================
+
+# Aliases típicos (AD&D/ediciones viejas / nombres comunes)
+_SPELL_ALIASES = {
+    # classic/legacy -> 5e canonical spell names
+    "cure light wounds": "cure wounds",
+    "cure serious wounds": "cure wounds",
+    "cause light wounds": "inflict wounds",
+    "cause serious wounds": "inflict wounds",
+
+    # common casing / spacing variants (safe)
+    "magic missile": "magic missile",
+    "fireball": "fireball",
+    "hold person": "hold person",
+    "faerie fire": "faerie fire",
+    "lightning bolt": "lightning bolt",
+}
+
+_TERM_ALIASES = {
+    # Feats / shorthand
+    "sharp shoot": "sharpshooter",
+    "sharp shooter": "sharpshooter",
+    "sharpshoot": "sharpshooter",
+    "great weapon mastery": "great weapon master",
+    "gwm": "great weapon master",
+    "ss": "sharpshooter",
+
+    # Combat terms
+    "sneak attack": "sneak attack",
+    "sa": "sneak attack",
+
+    # Spanish -> canonical concept tokens (kept as terms)
+    "sigilo": "stealth",
+}
+
+# Nombres que el usuario suele usar como “actor” aunque no esté en party
+# (si no existe, lo tratamos como PNJ relevante por defecto)
+_DEFAULT_ASSUME_NPC_NAMES = {"eldrin"}
+
+def _apply_term_aliases(text: str) -> Tuple[str, list]:
+    """Normaliza términos (feats, shorthand) y devuelve (texto_nuevo, cambios)."""
+    if not text:
+        return text, []
+    changes = []
+    out = text
+
+    for src, dst in _TERM_ALIASES.items():
+        pattern = re.compile(rf"\b{re.escape(src)}\b", re.IGNORECASE)
+        if pattern.search(out):
+            out = pattern.sub(dst, out)
+            changes.append((src, dst))
+
+    return out, changes
+
+def _inject_intent_hints(text: str) -> str:
+    """
+    Intents: asunciones razonables para que el DM no sea literal.
+    """
+    t = text or ""
+    tl = t.lower()
+
+    # (A) Ataque a melé => moverse y atacar si es posible
+    wants_melee = any(k in tl for k in ["a melé", "a melee", "melee", "cuerpo a cuerpo"])
+    mentions_attack = any(k in tl for k in ["ataca", "ataque", "golpea", "carga", "embiste"])
+    if wants_melee and mentions_attack:
+        t += (
+            "\n\n[INTENCIÓN IMPLÍCITA: si el atacante no está ya a melé, asume que se mueve lo necesario "
+            "para ponerse a melé (usando su movimiento) y luego ejecuta el ataque en el mismo turno, "
+            "salvo que sea físicamente imposible.]"
+        )
+
+    # (B) Sharpshooter / GWM => el usuario suele querer “usar el feat” automáticamente
+    if "sharpshooter" in tl or "great weapon master" in tl:
+        t += (
+            "\n\n[INTENCIÓN IMPLÍCITA: si el usuario menciona Sharpshooter o Great Weapon Master, asume que "
+            "quiere aplicar su opción de -5/+10 (si procede) y explica brevemente el impacto. "
+            "Si no procede (por reglas/arma), indícalo sin bloquear.]"
+        )
+
+    # (C) Sneak Attack => si hay condiciones razonables, aplícalo sin que el usuario lo “pida perfecto”
+    if "sneak attack" in tl:
+        t += (
+            "\n\n[INTENCIÓN IMPLÍCITA: si el usuario menciona Sneak Attack, aplica SA si se cumplen condiciones "
+            "(ventaja, o aliado adyacente al objetivo, etc.). Si no se cumplen, dilo y sugiere cómo habilitarlo.]"
+        )
+
+    # (D) Sigilo/Stealth => el usuario quiere moverse con cautela y tirar stealth cuando haga falta
+    if "stealth" in tl or "sigilo" in tl:
+        t += (
+            "\n\n[INTENCIÓN IMPLÍCITA: si el usuario indica sigilo/stealth, asume movimiento cauteloso y pide "
+            "una tirada de Stealth solo cuando haya riesgo real de ser detectado. No bloquees por ello.]"
+        )
+
+    # (E) PNJs no registrados (Eldrin, etc.)
+    for name in _DEFAULT_ASSUME_NPC_NAMES:
+        if re.search(rf"\b{re.escape(name)}\b", tl):
+            t += (
+                f"\n\n[NOTA: si '{name.title()}' no está en la party/canon, trátalo como PNJ aliado relevante "
+                "en la escena (no bloquees). Si necesitas concretar stats/rol, pregunta 1 cosa concreta.]"
+            )
+            break
+
+    return t
+
+def _preprocess_user_text(user_text: str) -> str:
+    """
+    Normaliza input del usuario para hacerlo más jugable:
+    - aliases de spells
+    - aliases de términos (feats/shorthand/idioma)
+    - hints de intención (mover y atacar, PNJs no registrados, etc.)
+    """
+    t = (user_text or "").strip()
+
+    # 1) aliases de spells
+    t2, spell_changes = _apply_spell_aliases(t)
+
+    # 2) aliases de términos (feats/shorthand/idioma)
+    t3, term_changes = _apply_term_aliases(t2)
+
+    changes = []
+    changes.extend(spell_changes)
+    changes.extend(term_changes)
+
+    if changes:
+        t3 += "\n\n[ALIASES APLICADOS: " + ", ".join([f"'{a}'→'{b}'" for a, b in changes]) + "]"
+
+    # 3) intención implícita
+    t3 = _inject_intent_hints(t3)
+
+    return t3
+
 def run_agent_turn(user_text: str, state: AgentState) -> str:
     """
     Ejecuta un turno del agente.
@@ -2656,7 +2792,9 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
         if not state.history or state.history[0].get("role") != "system":
             state.history.insert(0, _system_msg())
 
+        user_text = _preprocess_user_text(user_text)
         state.history.append(_user_msg(user_text))
+
 
         try:
             resp = _call_chat_with_retries(state.history)

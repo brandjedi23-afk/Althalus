@@ -5,3 +5,4 @@ data/sessions/
 data/logs/
 data/
 .vscode/
+dm/modules/*.pdf
