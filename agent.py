@@ -39,6 +39,7 @@ BESTIARY_PATH = ROOT / "dm" / "bestiary.json"
 ITEMS_PATH    = ROOT / "dm" / "items.json"
 SPELLS_PATH   = ROOT / "dm" / "spells.json"
 MODIFIERS_PATH = ROOT / "dm" / "modifiers.json"
+MODIFIERS_PATHS = [MODIFIERS_PATH]  # List of possible paths to check for modifiers
 
 # Cache separado para evitar conflicto de formatos:
 # - COMPENDIO: {"indexes": {"by_name": ...}, "monsters": {...}}
@@ -908,18 +909,25 @@ def get_spells_compendium() -> Optional[dict]:
 
 
 def get_modifiers_compendium() -> list:
-    """
-    Devuelve lista de modificadores (rules-as-data).
-    Formato: ver dm/modifiers.json
-    """
     global _MODIFIERS_CACHE
-    if _MODIFIERS_CACHE is None:
-        data = _load_json_file(MODIFIERS_PATH)
-        # debe ser lista
-        if isinstance(data, list):
-            _MODIFIERS_CACHE = data
-        else:
-            _MODIFIERS_CACHE = []
+    if _MODIFIERS_CACHE is not None:
+        return _MODIFIERS_CACHE
+
+    chosen = None
+    for p in MODIFIERS_PATHS:
+        try:
+            if isinstance(p, Path) and p.exists():
+                chosen = p
+                break
+        except Exception:
+            pass
+
+    if not chosen:
+        _MODIFIERS_CACHE = []
+        return _MODIFIERS_CACHE
+
+    data = _load_json_file(chosen)
+    _MODIFIERS_CACHE = data if isinstance(data, list) else []
     return _MODIFIERS_CACHE
 
 
@@ -964,6 +972,40 @@ def _canon_mode_token(s: str) -> str:
     if s1 in _MODE_ALIASES:
         return _MODE_ALIASES[s1]
     # versión sin espacios/underscore
+    s2 = re.sub(r"[^a-z0-9]+", "", s0)
+    if s2 in _MODE_ALIASES:
+        return _MODE_ALIASES[s2]
+    return s0
+
+_MODE_ALIASES = {
+    "sharpshooter": "sharpshooter",
+    "sharp shooter": "sharpshooter",
+    "sharp_shooter": "sharpshooter",
+    "tirador de elite": "sharpshooter",
+    "tirador de élite": "sharpshooter",
+
+    "gwm": "gwm",
+    "great weapon master": "gwm",
+    "greatweaponmaster": "gwm",
+    "gran maestro de armas": "gwm",
+
+    "sneak_attack": "sneak_attack",
+    "sneak attack": "sneak_attack",
+    "ataque furtivo": "sneak_attack",
+
+    "dread_ambusher": "dread_ambusher",
+    "dread ambusher": "dread_ambusher",
+    "gloom stalker": "dread_ambusher",
+    "gloomstalker": "dread_ambusher",
+}
+
+def _canon_mode_token(s: str) -> str:
+    s0 = _norm(s)
+    if not s0:
+        return ""
+    s1 = re.sub(r"[\s\-]+", " ", s0).strip()
+    if s1 in _MODE_ALIASES:
+        return _MODE_ALIASES[s1]
     s2 = re.sub(r"[^a-z0-9]+", "", s0)
     if s2 in _MODE_ALIASES:
         return _MODE_ALIASES[s2]
@@ -3249,6 +3291,20 @@ def _roll_damage_expr(expr: str, crit: bool = False) -> dict:
 
     return {"expr": expr, "ok": True, "total": total, "text": text_out}
 
+def _add_flat_to_damage_expr(expr: str, flat: int) -> str:
+    raw = (expr or "").strip().lower().replace(" ", "")
+    m = _DICE_RE.match(raw)
+    if not m:
+        return expr
+    n_str, sides_str, mod_str = m.groups()
+    n = int(n_str) if n_str else 1
+    mod = int(mod_str.replace(" ", "")) if mod_str else 0
+    mod2 = mod + int(flat or 0)
+    base = f"{n}d{sides_str}"
+    if mod2 == 0:
+        return base
+    sign = "+" if mod2 > 0 else ""
+    return f"{base}{sign}{mod2}"
 
 def _format_damage_expr(die: str, mod: int) -> str:
     die = (die or "1d8").strip()
@@ -3587,6 +3643,7 @@ def tool_resolve_actions(plan_json: str) -> str:
                 # damage expr: sumamos flat a su mod si puede parsearse (nada fancy: asumimos expr simple NdS(+/-)X)
                 # -> para spells tipo Fire Bolt: dmg_bonus_flat no aplica salvo que lo añadas en modifiers.json
                 dmg_expr = base_damage_expr
+                dmg_expr = _add_flat_to_damage_expr(dmg_expr, dmg_bonus_flat)
                 m = _DICE_RE.match((dmg_expr or "").strip().lower().replace(" ", ""))
                 if m:
                     n_str, sides_str, mod_str = m.groups()
@@ -3638,7 +3695,7 @@ def tool_resolve_actions(plan_json: str) -> str:
                 if ("sneak_attack" in modes) and (a_side == "party") and (_norm(actor_name) not in sneak_used_by):
                     sneak_used_by.add(_norm(actor_name))
                     sneak_dice = a.get("sneak_dice") or _get_sneak_dice(actor_obj)
-                    sa_roll = _roll_damage_expr(str(sneak_dice), crit=False)
+                    sa_roll = _roll_damage_expr(str(sneak_dice), crit=is_crit)
                     out.append("    SNEAK: " + sa_roll["text"])
                     out.append("    " + tool_damage(target_name, int(sa_roll["total"])))
 
@@ -5359,6 +5416,8 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
                 r"\bdc\b|\btirada\b|\bprueba\b|\bsalvaci[oó]n\b",
                 r"decidid vuestra acci[oó]n",
                 r"seguir atacando|intimidar|negociar|reagruparse|preparar una defensa|usar alguna habilidad",
+                r"\bopciones\b",
+                r"\bdecidid\b",
             ]
 
             def _narr_ok(txt: str) -> bool:
