@@ -38,6 +38,7 @@ MEMORY_PATH = ROOT / "data" / "memory.json"
 BESTIARY_PATH = ROOT / "dm" / "bestiary.json"
 ITEMS_PATH    = ROOT / "dm" / "items.json"
 SPELLS_PATH   = ROOT / "dm" / "spells.json"
+MODIFIERS_PATH = ROOT / "dm" / "modifiers.json"
 
 # Cache separado para evitar conflicto de formatos:
 # - COMPENDIO: {"indexes": {"by_name": ...}, "monsters": {...}}
@@ -46,6 +47,7 @@ _BESTIARY_COMP_CACHE: Optional[dict] = None
 _BESTIARY_FLAT_CACHE: Optional[dict] = None
 _ITEMS_CACHE: Optional[dict] = None
 _SPELLS_CACHE: Optional[dict] = None
+_MODIFIERS_CACHE: Optional[list] = None
 
 # =========================================================
 # Módulos (PDF) — indexado y consulta (fidelidad de aventura)
@@ -903,6 +905,129 @@ def get_spells_compendium() -> Optional[dict]:
     if _SPELLS_CACHE is None:
         _SPELLS_CACHE = _load_json_file(SPELLS_PATH)
     return _SPELLS_CACHE
+
+
+def get_modifiers_compendium() -> list:
+    """
+    Devuelve lista de modificadores (rules-as-data).
+    Formato: ver dm/modifiers.json
+    """
+    global _MODIFIERS_CACHE
+    if _MODIFIERS_CACHE is None:
+        data = _load_json_file(MODIFIERS_PATH)
+        # debe ser lista
+        if isinstance(data, list):
+            _MODIFIERS_CACHE = data
+        else:
+            _MODIFIERS_CACHE = []
+    return _MODIFIERS_CACHE
+
+
+def _ctx_has_feature(ctx: dict, needle: str) -> bool:
+    needle = _norm(needle)
+    feats = ctx.get("actor_features_lc", [])
+    return any(needle in f for f in feats)
+
+
+def _ctx_modes_include(ctx: dict, mode: str) -> bool:
+    return _norm(mode) in (ctx.get("modes", set()) or set())
+
+
+def _ctx_weapon_has(ctx: dict, tag: str) -> bool:
+    return _norm(tag) in (ctx.get("weapon_tags", set()) or set())
+
+
+def _ctx_weapon_lacks(ctx: dict, tag: str) -> bool:
+    return not _ctx_weapon_has(ctx, tag)
+
+
+def _mod_if_matches(mod_if: dict, ctx: dict) -> bool:
+    if not isinstance(mod_if, dict):
+        return True
+
+    # attack_type
+    if "attack_type" in mod_if:
+        want = mod_if["attack_type"]
+        if isinstance(want, list):
+            if ctx.get("attack_type") not in [str(x).lower() for x in want]:
+                return False
+        else:
+            if ctx.get("attack_type") != str(want).lower():
+                return False
+
+    # actor_feature_contains
+    if "actor_feature_contains" in mod_if:
+        want = mod_if["actor_feature_contains"]
+        if isinstance(want, list):
+            if not any(_ctx_has_feature(ctx, x) for x in want):
+                return False
+        else:
+            if not _ctx_has_feature(ctx, want):
+                return False
+
+    # mode_includes
+    if "mode_includes" in mod_if:
+        want = mod_if["mode_includes"]
+        if isinstance(want, list):
+            if not any(_ctx_modes_include(ctx, x) for x in want):
+                return False
+        else:
+            if not _ctx_modes_include(ctx, want):
+                return False
+
+    # weapon_has
+    if "weapon_has" in mod_if:
+        want = mod_if["weapon_has"]
+        if isinstance(want, list):
+            if not any(_ctx_weapon_has(ctx, x) for x in want):
+                return False
+        else:
+            if not _ctx_weapon_has(ctx, want):
+                return False
+
+    # weapon_lacks
+    if "weapon_lacks" in mod_if:
+        want = mod_if["weapon_lacks"]
+        if isinstance(want, list):
+            if not all(_ctx_weapon_lacks(ctx, x) for x in want):
+                return False
+        else:
+            if not _ctx_weapon_lacks(ctx, want):
+                return False
+
+    return True
+
+
+def _apply_attack_modifiers(ctx: dict) -> tuple[int, int, list]:
+    """
+    Devuelve: (to_hit_delta, damage_bonus_flat, notes[])
+    """
+    to_hit = 0
+    dmg_bonus = 0
+    notes = []
+
+    mods = get_modifiers_compendium() or []
+    for m in mods:
+        if (m.get("when") or "") != "attack":
+            continue
+        if not _mod_if_matches(m.get("if") or {}, ctx):
+            continue
+
+        ap = m.get("apply") or {}
+        try:
+            to_hit += int(ap.get("to_hit", 0) or 0)
+        except Exception:
+            pass
+        try:
+            dmg_bonus += int(ap.get("damage_bonus", 0) or 0)
+        except Exception:
+            pass
+
+        note = ap.get("note") or m.get("id")
+        if note:
+            notes.append(str(note))
+
+    return to_hit, dmg_bonus, notes
 
 
 def _get_spell_def_by_name(name: str) -> Optional[dict]:
@@ -2835,6 +2960,557 @@ def tool_execute_actions(script: str, default_target: str = "") -> str:
 
     return "\n".join(out_lines)
 
+def _equipped_items(member: dict) -> list:
+    inv = member.get("inventory") or []
+    return [it for it in inv if isinstance(it, dict) and it.get("equipped")]
+
+
+def _weapon_bonus(item: dict) -> int:
+    try:
+        return int(item.get("bonus", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _weapon_profile_from_item(item: dict, attack_type: str) -> dict:
+    """
+    Devuelve: {"die": "1d8", "tags": set(...), "finesse": bool, "heavy": bool}
+    """
+    name = _norm(item.get("name", ""))
+    tags = set()
+    finesse = False
+    heavy = False
+    two_handed = False
+
+    if attack_type == "ranged":
+        tags.add("ranged")
+    else:
+        tags.add("melee")
+
+    # Ranged
+    if "arco largo" in name or "longbow" in name:
+        two_handed = True
+        return {"die": "1d8", "tags": tags | {"two_handed"}, "finesse": False, "heavy": False}
+    if "arco corto" in name or "shortbow" in name:
+        two_handed = True
+        return {"die": "1d6", "tags": tags | {"two_handed"}, "finesse": False, "heavy": False}
+    if "ballesta" in name or "crossbow" in name:
+        two_handed = True
+        return {"die": "1d8", "tags": tags | {"two_handed"}, "finesse": False, "heavy": False}
+
+    # Melee (heavy/two-handed)
+    if "alabarda" in name or "halberd" in name:
+        heavy = True
+        two_handed = True
+        return {"die": "1d10", "tags": tags | {"heavy", "two_handed"}, "finesse": False, "heavy": True}
+    if "guja" in name or "glaive" in name:
+        heavy = True
+        two_handed = True
+        return {"die": "1d10", "tags": tags | {"heavy", "two_handed"}, "finesse": False, "heavy": True}
+
+    # Finesse
+    if "estoque" in name or "rapier" in name:
+        finesse = True
+        return {"die": "1d8", "tags": tags | {"finesse"}, "finesse": True, "heavy": False}
+    if "espada corta" in name or "shortsword" in name:
+        finesse = True
+        return {"die": "1d6", "tags": tags | {"finesse"}, "finesse": True, "heavy": False}
+
+    # Other melee
+    if "martillo de guerra" in name or "warhammer" in name:
+        return {"die": "1d8", "tags": tags, "finesse": False, "heavy": False}
+    if "maza" in name or "mace" in name:
+        return {"die": "1d6", "tags": tags, "finesse": False, "heavy": False}
+    if "bastón" in name or "staff" in name or "quarterstaff" in name:
+        return {"die": "1d6", "tags": tags, "finesse": False, "heavy": False}
+
+    # fallback estable
+    return {"die": "1d8", "tags": tags, "finesse": False, "heavy": False}
+
+
+def _attack_stat_mod(member: dict, finesse: bool, attack_type: str) -> int:
+    ab = member.get("abilities", {}) or {}
+    str_mod = _ability_mod(ab.get("str", 10))
+    dex_mod = _ability_mod(ab.get("dex", 10))
+    if attack_type == "ranged":
+        return dex_mod
+    return max(dex_mod, str_mod) if finesse else str_mod
+
+
+def _parse_forced_actor(actor_token: str) -> tuple[str, str]:
+    """
+    Permite: "Kaelen (rapier)" o "Myrmyr (bow)"
+    Devuelve: ("Kaelen", "rapier")
+    """
+    m = re.match(r"^(.+?)\s*\((.+?)\)\s*$", (actor_token or "").strip())
+    if not m:
+        return (actor_token or "").strip(), ""
+    return m.group(1).strip(), _norm(m.group(2))
+
+
+def _pick_weapon(member: dict, attack_type: str, forced: str = "") -> dict:
+    eq = _equipped_items(member)
+    if not eq:
+        return {}
+
+    def nm(it): return _norm(it.get("name", ""))
+
+    if forced:
+        forced_map = {
+            "arco": ["arco", "bow", "longbow", "shortbow"],
+            "bow": ["arco", "bow", "longbow", "shortbow"],
+            "estoque": ["estoque", "rapier"],
+            "rapier": ["estoque", "rapier"],
+            "alabarda": ["alabarda", "halberd"],
+            "halberd": ["alabarda", "halberd"],
+            "martillo": ["martillo", "warhammer"],
+            "warhammer": ["martillo", "warhammer"],
+            "bastón": ["bastón", "staff", "quarterstaff"],
+            "staff": ["bastón", "staff", "quarterstaff"],
+            "melee": ["alabarda", "halberd", "estoque", "rapier", "martillo", "warhammer", "bastón", "staff"],
+            "ranged": ["arco", "bow", "ballesta", "crossbow"],
+        }
+        keys = forced_map.get(forced, [forced])
+        for it in eq:
+            n = nm(it)
+            if any(k in n for k in keys):
+                return it
+
+    if attack_type == "ranged":
+        for it in eq:
+            n = nm(it)
+            if "arco" in n or "bow" in n or "ballesta" in n or "crossbow" in n:
+                return it
+        return eq[0]
+
+    # melee preference: heavy reach > finesse > others
+    for it in eq:
+        n = nm(it)
+        if "alabarda" in n or "halberd" in n or "glaive" in n or "guja" in n:
+            return it
+    for it in eq:
+        n = nm(it)
+        if "estoque" in n or "rapier" in n or "espada corta" in n or "shortsword" in n:
+            return it
+    return eq[0]
+
+
+def _auto_roll_mode_from_target(target_obj: dict, attack_type: str) -> tuple[str, list]:
+    conds = _ensure_conditions(target_obj)
+    cond_names = {str(c.get("name", "")).strip().lower() for c in conds}
+    notes = []
+    mode = "normal"
+    if "paralyzed" in cond_names:
+        mode = "adv"
+        notes.append("AUTO: target PARALYZED => ADV")
+    if "prone" in cond_names:
+        if attack_type == "melee":
+            mode = "adv"
+            notes.append("AUTO: target PRONE + melee => ADV")
+        else:
+            mode = "dis"
+            notes.append("AUTO: target PRONE + ranged => DIS")
+    return mode, notes
+
+
+_DICE_RE = re.compile(r"^\s*(\d*)d(\d+)\s*([+-]\s*\d+)?\s*$", re.IGNORECASE)
+
+def _roll_damage_expr(expr: str, crit: bool = False) -> dict:
+    """
+    expr: "1d8+6"
+    crit: duplica SOLO los dados, no el modificador flat.
+    """
+    raw = (expr or "").strip().lower().replace(" ", "")
+    m = _DICE_RE.match(raw)
+    if not m:
+        return {"expr": expr, "ok": False, "total": 0, "text": f"{expr} -> (FORMATO INVÁLIDO)"}
+
+    n_str, sides_str, mod_str = m.groups()
+    n = int(n_str) if n_str else 1
+    sides = int(sides_str)
+    mod = int(mod_str.replace(" ", "")) if mod_str else 0
+
+    rolls1 = [random.randint(1, sides) for _ in range(n)]
+    rolls2 = [random.randint(1, sides) for _ in range(n)] if crit else []
+    total = sum(rolls1) + sum(rolls2) + mod
+
+    if crit:
+        text_out = f"{expr} -> rolls={rolls1}, CRIT rolls={rolls2}, mod={mod}, total={total}"
+    else:
+        text_out = f"{expr} -> rolls={rolls1}, mod={mod}, total={total}"
+
+    return {"expr": expr, "ok": True, "total": total, "text": text_out}
+
+
+def _format_damage_expr(die: str, mod: int) -> str:
+    die = (die or "1d8").strip()
+    if mod == 0:
+        return die
+    sign = "+" if mod > 0 else ""
+    return f"{die}{sign}{mod}"
+
+
+def _get_sneak_dice(member: dict) -> str:
+    feats = member.get("features") or []
+    for f in feats:
+        s = str(f)
+        m = re.search(r"Sneak\s*Attack\s*\((\d+d\d+)\)", s, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    # fallback razonable
+    return "3d6"
+
+
+def _is_focus_cd_attack(item: dict) -> bool:
+    n = _norm(item.get("name", ""))
+    return ("cd/attack" in n) or ("cd/ataque" in n) or ("spell attack" in n)
+
+
+def _spell_attack_bonus(member: dict) -> int:
+    classes = member.get("classes") or []
+    main = ""
+    main_lvl = -1
+    for c in classes:
+        try:
+            lvl = int(c.get("level", 0) or 0)
+        except Exception:
+            lvl = 0
+        if lvl > main_lvl:
+            main_lvl = lvl
+            main = _norm(c.get("name", ""))
+
+    casting = {
+        "wizard": "int",
+        "sorcerer": "cha",
+        "warlock": "cha",
+        "bard": "cha",
+        "cleric": "wis",
+        "druid": "wis",
+        "paladin": "cha",
+        "ranger": "wis",
+        "artificer": "int",
+    }
+    ab_key = casting.get(main, "int")
+    ab = member.get("abilities", {}) or {}
+    mod = _ability_mod(ab.get(ab_key, 10))
+    prof = int(member.get("prof_bonus", 0) or 0)
+
+    # foco CD/Attack equipado: suma su bonus si lo tiene
+    focus_bonus = 0
+    for it in _equipped_items(member):
+        if _is_focus_cd_attack(it):
+            focus_bonus = max(focus_bonus, _weapon_bonus(it))
+    return prof + mod + focus_bonus
+
+
+def _fire_bolt_damage(member: dict) -> str:
+    lvl = int(member.get("total_level", 1) or 1)
+    if lvl >= 17:
+        return "4d10"
+    if lvl >= 11:
+        return "3d10"
+    if lvl >= 5:
+        return "2d10"
+    return "1d10"
+
+
+def tool_resolve_actions(plan_json: str) -> str:
+    """
+    Ejecuta un Action Plan JSON (sin parser frágil).
+    plan_json ejemplo:
+    {
+      "actions":[
+        {"type":"attack","actor":"Myrmyr Lash","target":"Bandit A","count":3,"attack_type":"ranged","weapon_hint":"bow","modes":["sharpshooter"]},
+        {"type":"attack","actor":"Kaelen el Sombrío","target":"Bandit A","count":2,"attack_type":"melee","weapon_hint":"rapier","modes":["sneak_attack"]},
+        {"type":"spell_attack","actor":"Trip","target":"Bandit A","spell":"Fire Bolt"}
+      ]
+    }
+    """
+    try:
+        plan = json.loads(plan_json or "{}")
+    except Exception as e:
+        return f"ERROR: plan_json no es JSON válido: {e}"
+
+    actions = plan.get("actions")
+    if not isinstance(actions, list) or not actions:
+        return "ERROR: plan_json debe incluir {'actions':[...]}"
+
+    canon = canon_load()
+    party = canon.get("party", {}) or {}
+    members = party.get("members") or []
+
+    # index rápido de PJ
+    members_by_lc = {_norm(m.get("name", "")): m for m in members if m.get("name")}
+    out = []
+    sneak_used_by = set()  # 1/turn dentro de esta resolución
+
+    def _ensure_target_exists(name: str):
+        """
+        Asegura que el target exista como party/enemy.
+        - intenta spawn_encounter con bestiary (si hay match)
+        - si no, crea stub razonable (AC 10 / HP 10), NUNCA 999
+        """
+        name = (name or "").strip()
+        if not name:
+            return
+
+        c = canon_load()
+        if _get_target_container(c, name):
+            return
+
+        # Intento: spawn real (bestiary/generado)
+        try:
+            payload = {"enemies": [{"name": name}]}
+            tool_spawn_encounter(json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            pass
+
+        c2 = canon_load()
+        if _get_target_container(c2, name):
+            return
+
+        # Último recurso: stub razonable
+        try:
+            _ensure_enemy_stub_anywhere(c2, name, defaults={"ac": 10, "max_hp": 10, "hp_current": 10})
+            canon_save(c2)
+        except Exception:
+            pass
+
+        # si ya existe como party/enemy, ok
+        c = canon_load()
+        if _get_target_container(c, name):
+            return
+
+        # si no existe, intenta autospawn desde bestiary (si hay helper disponible)
+        try:
+            # intenta usar spawn_encounter si existe en tu agent.py
+            if "tool_spawn_encounter" in globals():
+                tool_spawn_encounter(name, 1)
+        except Exception:
+            pass
+
+        # si sigue sin existir, crea stub como enemigo (último recurso)
+        c2 = canon_load()
+        if not _get_target_container(c2, name):
+            try:
+                _ensure_enemy_stub_anywhere(c2, name, defaults={"ac": 10, "max_hp": 999, "hp_current": 999})
+                canon_save(c2)
+            except Exception:
+                pass
+
+    for i, a in enumerate(actions, start=1):
+        if not isinstance(a, dict):
+            out.append(f"[{i}] ERROR: acción no es objeto JSON.")
+            continue
+
+        typ = _norm(a.get("type", ""))
+        actor_raw = a.get("actor", "") or ""
+        target = a.get("target", "") or ""
+
+        actor, forced = _parse_forced_actor(actor_raw)
+
+        if not typ:
+            out.append(f"[{i}] ERROR: falta 'type'.")
+            continue
+
+        # acciones simples
+        if typ == "move":
+            feet = int(a.get("feet", 0) or 0)
+            out.append(f"[{i}] MOVE: {actor} {feet} ft")
+            out.append(tool_move(actor, feet))
+            continue
+
+        if typ == "apply_condition":
+            cond = a.get("condition", "")
+            rounds = int(a.get("rounds", 1) or 1)
+            tgt = target or actor
+            _ensure_target_exists(tgt)
+            out.append(f"[{i}] APPLY_CONDITION: {tgt} {cond} ({rounds})")
+            out.append(tool_apply_condition(tgt, cond, rounds))
+            continue
+
+        if typ == "remove_condition":
+            cond = a.get("condition", "")
+            tgt = target or actor
+            _ensure_target_exists(tgt)
+            out.append(f"[{i}] REMOVE_CONDITION: {tgt} {cond}")
+            out.append(tool_remove_condition(tgt, cond))
+            continue
+
+        if typ == "damage":
+            amt = int(a.get("amount", 0) or 0)
+            tgt = target or actor
+            _ensure_target_exists(tgt)
+            out.append(f"[{i}] DAMAGE: {tgt} {amt}")
+            out.append(tool_damage(tgt, amt))
+            continue
+
+        if typ == "heal":
+            amt = int(a.get("amount", 0) or 0)
+            tgt = target or actor
+            out.append(f"[{i}] HEAL: {tgt} {amt}")
+            out.append(tool_heal(tgt, amt))
+            continue
+
+        # asegurar target si hace falta
+        if target:
+            _ensure_target_exists(target)
+
+        # ATTACK / SPELL_ATTACK
+        if typ in {"attack", "spell_attack"}:
+            # localizar actor
+            canon_now = canon_load()
+            found_a = _get_target_container(canon_now, actor)
+            if not found_a:
+                out.append(f"[{i}] ERROR: no encuentro actor '{actor}'.")
+                continue
+            a_side, actor_obj, actor_name = found_a
+
+            # localizar target (permite party o enemy)
+            found_t = _get_target_container(canon_now, target) if target else None
+            if not found_t:
+                out.append(f"[{i}] ERROR: no encuentro target '{target}'.")
+                continue
+            t_side, target_obj, target_name = found_t
+
+            count = int(a.get("count", 1) or 1)
+            count = max(1, min(20, count))
+
+            attack_type = _norm(a.get("attack_type", "")) or ("ranged" if typ == "spell_attack" else "melee")
+            if attack_type not in {"melee", "ranged"}:
+                attack_type = "melee"
+
+            roll_mode = _norm(a.get("roll_mode", "auto"))  # auto|normal|adv|dis
+            if roll_mode not in {"auto", "normal", "adv", "dis"}:
+                roll_mode = "auto"
+
+            modes = a.get("modes") or []
+            if isinstance(modes, str):
+                modes = [modes]
+            modes = {_norm(x) for x in modes if str(x).strip()}
+
+            crit_range = int(a.get("crit_range", 20) or 20)
+            crit_range = max(2, min(20, crit_range))
+
+            # build actor features lc
+            actor_features_lc = []
+            if a_side == "party":
+                actor_features_lc = [_norm(x) for x in (actor_obj.get("features") or [])]
+            else:
+                actor_features_lc = [_norm(x) for x in (actor_obj.get("features") or [])] if isinstance(actor_obj.get("features"), list) else []
+
+            # base bonus/damage
+            weapon_tags = set()
+            weapon_item = {}
+            die = a.get("damage_die")  # override opcional
+            base_bonus = None
+            base_damage_expr = None
+
+            if typ == "spell_attack":
+                if a_side != "party":
+                    out.append(f"[{i}] ERROR: spell_attack requiere actor PJ (por ahora).")
+                    continue
+                atk_bonus = _spell_attack_bonus(actor_obj)
+                dmg_die = "1d10"
+                spell = _norm(a.get("spell", ""))
+                if "firebolt" in spell or "fire bolt" in spell:
+                    dmg_die = _fire_bolt_damage(actor_obj)
+                # sin mod de habilidad por defecto en cantrip tipo Fire Bolt
+                base_bonus = atk_bonus
+                base_damage_expr = dmg_die
+                weapon_tags = {"spell_attack", "ranged"}
+            else:
+                if a_side == "party":
+                    weapon_hint = _norm(a.get("weapon_hint", "")) or forced
+                    weapon_item = _pick_weapon(actor_obj, attack_type, weapon_hint)
+                    prof = int(actor_obj.get("prof_bonus", 0) or 0)
+                    wb = _weapon_bonus(weapon_item) if weapon_item else 0
+
+                    prof_w = _weapon_profile_from_item(weapon_item or {}, attack_type)
+                    die = die or prof_w["die"]
+                    weapon_tags = set(prof_w["tags"] or set())
+                    finesse = bool(prof_w.get("finesse"))
+                    stat_mod = _attack_stat_mod(actor_obj, finesse, attack_type)
+
+                    base_bonus = prof + stat_mod + wb
+                    base_damage_expr = _format_damage_expr(die, stat_mod + wb)
+                else:
+                    # Enemy: por ahora requiere que el plan provea bonus/damage o usa defaults.
+                    base_bonus = int(a.get("bonus", 0) or actor_obj.get("atk_bonus", 0) or 0)
+                    die = die or str(a.get("damage", "1d8"))
+                    base_damage_expr = str(a.get("damage", die))
+                    weapon_tags = {"enemy"}
+
+            # ejecutar N ataques
+            out.append(f"[{i}] {typ.upper()}: {actor_name} -> {target_name} x{count} ({attack_type})")
+            for k in range(1, count + 1):
+                # modo adv/dis
+                auto_notes = []
+                if roll_mode == "auto":
+                    rm, auto_notes = _auto_roll_mode_from_target(target_obj, attack_type)
+                    mode_use = rm
+                else:
+                    mode_use = roll_mode
+
+                # contexto para modifiers.json
+                ctx = {
+                    "attack_type": attack_type,
+                    "modes": modes,
+                    "weapon_tags": weapon_tags,
+                    "actor_features_lc": actor_features_lc,
+                }
+                to_hit_delta, dmg_bonus_flat, mod_notes = _apply_attack_modifiers(ctx)
+
+                bonus = int(base_bonus or 0) + to_hit_delta
+                # damage expr: sumamos flat a su mod si puede parsearse (nada fancy: asumimos expr simple NdS(+/-)X)
+                # -> para spells tipo Fire Bolt: dmg_bonus_flat no aplica salvo que lo añadas en modifiers.json
+                dmg_expr = base_damage_expr
+                m = _DICE_RE.match((dmg_expr or "").strip().lower().replace(" ", ""))
+                if m:
+                    n_str, sides_str, mod_str = m.groups()
+                    base_mod = int(mod_str.replace(" ", "")) if mod_str else 0
+                    dmg_expr = _format_damage_expr(f"{(n_str or '1')}d{sides_str}", base_mod + dmg_bonus_flat)
+
+                # tirada ataque
+                r1 = random.randint(1, 20)
+                r2 = random.randint(1, 20) if mode_use in {"adv", "dis"} else None
+                chosen = r1 if r2 is None else (max(r1, r2) if mode_use == "adv" else min(r1, r2))
+                total = chosen + bonus
+
+                ac = int(target_obj.get("ac", 10) or 10)
+                hit = total >= ac
+                is_crit = chosen >= crit_range
+
+                out.append(f"  - [{k}/{count}] d20: {r1}" + (f", {r2} -> {chosen}" if r2 is not None else f" -> {chosen}") + f" +{bonus} = {total} vs AC {ac} => " + ("HIT" if hit else "MISS"))
+
+                notes_all = []
+                notes_all.extend(auto_notes)
+                notes_all.extend(mod_notes)
+                if notes_all:
+                    out.append("    NOTES: " + " | ".join(notes_all))
+
+                if not hit:
+                    continue
+
+                # daño + aplicar
+                dmg_roll = _roll_damage_expr(dmg_expr, crit=is_crit)
+                out.append("    DMG: " + dmg_roll["text"])
+                out.append("    " + tool_damage(target_name, int(dmg_roll["total"])))
+
+                # Sneak Attack (1/turn dentro de este resolve)
+                if ("sneak_attack" in modes) and (a_side == "party") and (_norm(actor_name) not in sneak_used_by):
+                    sneak_used_by.add(_norm(actor_name))
+                    sneak_dice = a.get("sneak_dice") or _get_sneak_dice(actor_obj)
+                    sa_roll = _roll_damage_expr(str(sneak_dice), crit=False)
+                    out.append("    SNEAK: " + sa_roll["text"])
+                    out.append("    " + tool_damage(target_name, int(sa_roll["total"])))
+
+            continue
+
+        out.append(f"[{i}] ERROR: type '{typ}' no soportado todavía.")
+
+    return "\n".join(out)
+
 def tool_stabilize(target: str) -> str:
     canon = canon_load()
     m = _find_party_member(canon, target)
@@ -3407,6 +4083,7 @@ TOOLS: Dict[str, Callable[..., str]] = {
     "heal": tool_heal,
     "damage": tool_damage,
     "execute_actions": tool_execute_actions,
+    "resolve_actions": tool_resolve_actions,
     "stabilize": tool_stabilize,
     "rest": tool_rest,
 
@@ -3462,6 +4139,13 @@ TOOL_SCHEMAS = [
         "query": {"type": "string"},
         "limit": {"type": "integer"}
     }, []),
+
+    _schema(
+        "resolve_actions",
+        "Ejecuta un Action Plan JSON (múltiples acciones encadenadas) sin parsers frágiles.",
+        {"plan_json": {"type": "string"}},
+        ["plan_json"]
+    ),
 
     _schema("module_load", "Indexa y carga un módulo PDF y lo marca activo en canon.session.module.", {
         "module_id": {"type": "string"},
@@ -3589,7 +4273,58 @@ SYSTEM = f"""
 Eres un Dungeon Master (DM) para D&D 5e.
 Prioridad: inmersión + continuidad + reglas consistentes.
 
-ESTILO (OBLIGATORIO):
+# =========================================================
+# Planner / Narrator (pipeline: PLAN -> EXECUTE -> NARRATE)
+# =========================================================
+"""
+
+PLANNER_SYSTEM = """
+Eres un planificador táctico para D&D 5e. Tu única salida DEBE ser un JSON válido.
+NO escribas texto fuera del JSON.
+
+Objetivo: convertir la intención del usuario en una lista de acciones ejecutables por el motor.
+
+Devuelve un objeto JSON con:
+{
+  "actions": [
+    { ... },
+    ...
+  ]
+}
+
+Acciones soportadas (elige las que apliquen):
+- attack:
+  {"type":"attack","actor":"<name>","target":"<name>","count":N,
+   "attack_type":"melee|ranged","weapon_hint":"bow|rapier|halberd|melee|ranged|... (opcional)",
+   "roll_mode":"auto|normal|adv|dis (opcional)",
+   "modes":["sharpshooter","gwm","sneak_attack",... (opcional)],
+   "crit_range":20 (opcional)}
+- spell_attack (por ahora cantrips tipo Fire Bolt):
+  {"type":"spell_attack","actor":"<name>","target":"<name>","spell":"Fire Bolt",
+   "roll_mode":"auto|normal|adv|dis (opcional)"}
+- move:
+  {"type":"move","actor":"<name>","feet":30}
+- apply_condition / remove_condition:
+  {"type":"apply_condition","target":"<name>","condition":"PRONE","rounds":1}
+  {"type":"remove_condition","target":"<name>","condition":"PRONE"}
+- damage / heal:
+  {"type":"damage","target":"<name>","amount":7}
+  {"type":"heal","target":"<name>","amount":6}
+
+Reglas:
+- Si el usuario describe múltiples acciones encadenadas (varios PJ y/o varios ataques), SIEMPRE genera actions[].
+- Usa nombres EXACTOS de actores/targets del snapshot de CANON si aparecen.
+- Si el usuario menciona Sharpshooter/GWM/Sneak Attack, añádelo en "modes".
+- Si no estás seguro del target, elige el target más probable (no pidas aclaración).
+"""
+
+NARRATOR_SYSTEM = """
+Eres un Director de Juego de D&D 5e. Vas a narrar el resultado de una resolución ya ejecutada por el motor.
+NO repitas tiradas ni inventes resultados mecánicos: eso ya está en la sección RESOLUCIÓN que pondrá el sistema.
+Tu tarea: narración clara, cinematográfica y coherente, y terminar preguntando “¿qué hacéis ahora?”.
+"""
+
+ESTILO_RULES = """
 {DM_STYLE}
 
 REGLAS DE USO:
@@ -3598,6 +4333,7 @@ REGLAS DE USO:
 - Después de una resolución importante, registra 1–2 líneas con log_event().
 - No inventes números si importan: consulta el canon.
 - Para tiradas de habilidad de un PJ, usa skill_check(actor, skill, dc, mode) para calcular bonus automáticamente.
+- Si el usuario da múltiples acciones encadenadas (varios PJ o varias acciones seguidas), genera un Action Plan JSON y llama UNA sola vez a resolve_actions(plan_json). Evita parsers tipo execute_actions salvo legacy.
 
 MODO ESCENA (CRÍTICO):
 - dm_turn NO ES “solo combate”. Si no hay combate activo, SIEMPRE continúas la aventura en modo escena (exploración/social/decisiones).
@@ -3763,6 +4499,145 @@ def _call_chat_with_retries(messages: List[dict], *, max_attempts: int = 4):
                 continue
 
     raise RuntimeError(f"OPENAI_ERROR:OTHER | {last_err}") from last_err
+
+def _should_use_action_planner(user_text: str, canon: dict) -> bool:
+    """
+    Activa planner cuando hay combate / acciones encadenadas.
+    Heurística: combate activo, o palabras clave de ataques/casts, o conteos (x2, 3 disparos...).
+    """
+    combat = canon.get("combat", {}) or {}
+    if combat.get("active"):
+        return True
+
+    t = _norm(user_text or "")
+
+    # palabras clave comunes
+    kw = [
+        "ataque", "ataca", "ataques", "disparo", "disparos", "shoot", "attacks",
+        "castea", "lanza", "cast", "fire bolt", "sneak", "gwm", "sharpshooter",
+        "asalto", "turno", "round", "acciones", "action surge"
+    ]
+    if any(k in t for k in kw):
+        return True
+
+    # patrones de conteo
+    if re.search(r"\b\d+\s*(ataques|disparos|attacks|shots)\b", t):
+        return True
+    if re.search(r"\bx\s*\d+\b", t):  # x2, x3
+        return True
+
+    return False
+
+
+def _canon_snapshot_for_planner(canon: dict, *, max_feats: int = 10) -> dict:
+    """
+    Snapshot compacto para que el planner use nombres y stats sin tragarse todo el canon.
+    """
+    snap = {"party": [], "enemies": [], "combat": canon.get("combat", {}) or {}}
+
+    party = (canon.get("party", {}) or {}).get("members", []) or []
+    for m in party:
+        if not isinstance(m, dict):
+            continue
+        feats = m.get("features") or []
+        feats_lite = [str(x) for x in feats[:max_feats]]
+        snap["party"].append({
+            "name": m.get("name", ""),
+            "ac": m.get("ac", None),
+            "hp": m.get("hp", None),
+            "max_hp": m.get("max_hp", None),
+            "prof_bonus": m.get("prof_bonus", None),
+            "abilities": m.get("abilities", {}) or {},
+            "features": feats_lite,
+            "equipped": [it.get("name") for it in (m.get("inventory") or []) if isinstance(it, dict) and it.get("equipped")],
+        })
+
+    enemies = canon.get("enemies", {}) or {}
+    for name, e in enemies.items():
+        if not isinstance(e, dict):
+            continue
+        # runtime HP unificado
+        hp_cur = e.get("hp_current", e.get("hp", None))
+        hp_max = e.get("max_hp", e.get("hp_max", None))
+        conds = _ensure_conditions(e)
+        snap["enemies"].append({
+            "name": name,
+            "ac": e.get("ac", None),
+            "hp": hp_cur,
+            "max_hp": hp_max,
+            "conditions": [c.get("name") for c in conds if isinstance(c, dict)],
+            "stub": e.get("stub", None),
+            "source": e.get("source", None),
+        })
+
+    return snap
+
+
+def _call_planner_json(user_text: str, canon: dict) -> Optional[dict]:
+    """
+    Llama al modelo para generar SOLO JSON {actions:[...]}.
+    """
+    snap = _canon_snapshot_for_planner(canon)
+    messages = [
+        {"role": "system", "content": PLANNER_SYSTEM.strip()},
+        {"role": "user", "content": "USER_INPUT:\n" + (user_text or "").strip() + "\n\nCANON_SNAPSHOT:\n" + json.dumps(snap, ensure_ascii=False)}
+    ]
+
+    # Intento con response_format si la lib lo soporta; fallback si no.
+    try:
+        resp = client.chat.completions.create(
+            model=_require_model(),
+            messages=messages,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+    except TypeError:
+        resp = client.chat.completions.create(
+            model=_require_model(),
+            messages=messages,
+            temperature=0.1,
+        )
+
+    content = (resp.choices[0].message.content or "").strip()
+    if not content:
+        return None
+
+    try:
+        plan = json.loads(content)
+    except Exception:
+        return None
+
+    if not isinstance(plan, dict):
+        return None
+    actions = plan.get("actions")
+    if not isinstance(actions, list) or not actions:
+        return None
+
+    return plan
+
+
+def _call_narrator_text(user_text: str, canon_after: dict, plan: dict, resolution_text: str) -> str:
+    """
+    El narrador devuelve SOLO narración (sin mecánica).
+    """
+    snap = _canon_snapshot_for_planner(canon_after, max_feats=6)
+    messages = [
+        {"role": "system", "content": NARRATOR_SYSTEM.strip()},
+        {"role": "user", "content":
+            "Entrada del usuario:\n" + (user_text or "").strip()
+            + "\n\nSnapshot post-resolución:\n" + json.dumps(snap, ensure_ascii=False)
+            + "\n\nPlan ejecutado:\n" + json.dumps(plan, ensure_ascii=False)
+            + "\n\nSalida del motor (no la repitas, solo úsala para narrar):\n" + resolution_text
+            + "\n\nDevuelve SOLO narración + pregunta final."
+        }
+    ]
+
+    resp = client.chat.completions.create(
+        model=_require_model(),
+        messages=messages,
+        temperature=0.6,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 def _parse_tool_args(args_raw: Any) -> dict:
     if isinstance(args_raw, dict):
@@ -4225,6 +5100,37 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
         user_text = _preprocess_user_text(user_text)
         state.history.append(_user_msg(user_text))
 
+        # =========================================================
+        # PIPELINE: PLAN -> EXECUTE -> NARRATE (para multi-acciones / combate)
+        # =========================================================
+        canon_now = canon_load()
+        if _should_use_action_planner(user_text, canon_now):
+            plan = _call_planner_json(user_text, canon_now)
+            if plan:
+                plan_str = json.dumps(plan, ensure_ascii=False)
+
+                # Ejecuta motor (actualiza canon)
+                resolution = tool_resolve_actions(plan_str)
+
+                # Canon post-ejecución
+                canon_after = canon_load()
+
+                # Narración (solo texto)
+                narr = _call_narrator_text(user_text, canon_after, plan, resolution)
+
+                final = "RESOLUCIÓN (mecánica)\n```text\n" + resolution + "\n```\n\n" + (narr or "").strip()
+
+                # Persistir en history para continuidad
+                state.history.append(_assistant_msg(final))
+
+                # (opcional) log a session.md para auditoría
+                try:
+                    tool_log_event("=== TURN ===\nPLAN:\n" + plan_str + "\n\nRESOLUTION:\n" + resolution + "\n\n")
+                except Exception:
+                    pass
+
+                return final
+        # =========================================================
 
         try:
             resp = _call_chat_with_retries(state.history)
