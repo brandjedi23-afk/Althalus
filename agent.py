@@ -1083,19 +1083,30 @@ def _mod_if_matches(mod_if: dict, ctx: dict) -> bool:
 def _apply_attack_modifiers(ctx: dict) -> tuple[int, int, list]:
     """
     Devuelve: (to_hit_delta, damage_bonus_flat, notes[])
+    - Primero aplica rules-as-data desde modifiers.json
+    - Luego aplica fallback builtin para SS/GWM si no se aplicaron (para evitar “no matchea y se rompe”)
     """
     to_hit = 0
     dmg_bonus = 0
     notes = []
 
+    applied_ids: set[str] = set()
+
     mods = get_modifiers_compendium() or []
     for m in mods:
-        if (m.get("when") or "") != "attack":
+        if not isinstance(m, dict):
+            continue
+        when = (m.get("when") or "").strip().lower()
+        if when != "attack":
             continue
         if not _mod_if_matches(m.get("if") or {}, ctx):
             continue
 
         ap = m.get("apply") or {}
+        mid = str(m.get("id") or "").strip()
+        if mid:
+            applied_ids.add(mid)
+
         try:
             to_hit += int(ap.get("to_hit", 0) or 0)
         except Exception:
@@ -1105,9 +1116,27 @@ def _apply_attack_modifiers(ctx: dict) -> tuple[int, int, list]:
         except Exception:
             pass
 
-        note = ap.get("note") or m.get("id")
+        note = ap.get("note") or mid
         if note:
             notes.append(str(note))
+
+    # ----------------------------
+    # Fallback builtin (SS / GWM)
+    # ----------------------------
+    # Sharpshooter: ranged + mode sharpshooter => -5/+10
+    if _ctx_modes_include(ctx, "sharpshooter") and ctx.get("attack_type") == "ranged":
+        if "sharpshooter_power_shot" not in applied_ids:
+            to_hit -= 5
+            dmg_bonus += 10
+            notes.append("Sharpshooter (-5/+10) [builtin]")
+
+    # GWM: melee + heavy + mode gwm => -5/+10
+    if _ctx_modes_include(ctx, "gwm") and ctx.get("attack_type") == "melee":
+        if _ctx_weapon_has(ctx, "heavy"):
+            if "gwm_power_attack" not in applied_ids:
+                to_hit -= 5
+                dmg_bonus += 10
+                notes.append("GWM (-5/+10) [builtin]")
 
     return to_hit, dmg_bonus, notes
 
@@ -3554,6 +3583,7 @@ def tool_resolve_actions(plan_json: str) -> str:
             modes = {_canon_mode_token(x) for x in modes if str(x).strip()}
             modes = {m for m in modes if m}
 
+
             crit_range = int(a.get("crit_range", 20) or 20)
             crit_range = max(2, min(20, crit_range))
 
@@ -3606,6 +3636,13 @@ def tool_resolve_actions(plan_json: str) -> str:
                     base_damage_expr = str(a.get("damage", die))
                     weapon_tags = {"enemy"}
 
+            # Heurística: si es melee y el dado base es 1d12 o 2d6 0 1d10, trátalo como arma heavy (para GWM)
+            if attack_type == "melee":
+                d0 = (die or "").strip().lower().replace(" ", "")
+                if d0 in {"1d12", "2d6"}:
+                    weapon_tags.add("heavy")
+                    weapon_tags.add("two_handed")
+
             # ejecutar N ataques
             out.append(f"[{i}] {typ.upper()}: {actor_name} -> {target_name} x{count} ({attack_type})")
             # Dread Ambusher (Gloom Stalker): 1/combate en round 1, añade 1d8 al primer HIT de esta acción
@@ -3638,6 +3675,10 @@ def tool_resolve_actions(plan_json: str) -> str:
                     "actor_features_lc": actor_features_lc,
                 }
                 to_hit_delta, dmg_bonus_flat, mod_notes = _apply_attack_modifiers(ctx)
+                bonus = int(base_bonus or 0) + to_hit_delta
+                dmg_expr = base_damage_expr
+                dmg_expr = _add_flat_to_damage_expr(dmg_expr, dmg_bonus_flat)
+
 
                 bonus = int(base_bonus or 0) + to_hit_delta
                 # damage expr: sumamos flat a su mod si puede parsearse (nada fancy: asumimos expr simple NdS(+/-)X)
@@ -3693,8 +3734,19 @@ def tool_resolve_actions(plan_json: str) -> str:
 
                 # Sneak Attack (1/turn dentro de este resolve)
                 if ("sneak_attack" in modes) and (a_side == "party") and (_norm(actor_name) not in sneak_used_by):
-                    sneak_used_by.add(_norm(actor_name))
-                    sneak_dice = a.get("sneak_dice") or _get_sneak_dice(actor_obj)
+                sneak_dice = a.get("sneak_dice") or _get_sneak_dice(actor_obj)
+                sneak_dice = str(sneak_dice or "").strip().lower().replace(" ", "")
+
+                # Si no es NdS válido, fallback por nivel de pícaro
+                if not _DICE_RE.match(sneak_dice):
+                    rl = _rogue_level(actor_obj)
+                    sneak_dice = _sneak_dice_from_level(rl) if rl > 0 else "1d6"
+
+                # Sneak Attack critéea si el ataque fue crítico
+                sa_roll = _roll_damage_expr(sneak_dice, crit=is_crit)
+                out.append("    SNEAK: " + sa_roll["text"])
+                out.append("    " + tool_damage(target_name, int(sa_roll["total"])))
+
                     sa_roll = _roll_damage_expr(str(sneak_dice), crit=is_crit)
                     out.append("    SNEAK: " + sa_roll["text"])
                     out.append("    " + tool_damage(target_name, int(sa_roll["total"])))
@@ -5418,6 +5470,7 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
                 r"seguir atacando|intimidar|negociar|reagruparse|preparar una defensa|usar alguna habilidad",
                 r"\bopciones\b",
                 r"\bdecidid\b",
+
             ]
 
             def _narr_ok(txt: str) -> bool:
@@ -5495,6 +5548,11 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
 
             if not _narr_ok(narr):
                 narr = _fallback_narration(plan, canon_after)
+
+            # corta cualquier cosa que venga después de la pregunta final
+            q = "¿Qué hacéis ahora?"
+            if isinstance(narr, str) and q in narr:
+                narr = narr[:narr.rfind(q) + len(q)]
 
             # 5) Estado exacto (PV/condiciones) + mecánica si debug
             status = _enemy_status_summary(canon_after)
