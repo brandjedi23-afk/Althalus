@@ -2696,20 +2696,6 @@ def tool_execute_actions(script: str, default_target: str = "") -> str:
         return ("cd/attack" in n) or ("cd/ataque" in n) or ("spell attack" in n)
 
     # ---- NUEVO: leer Sneak Attack del canon (p.ej. "Sneak Attack (3d6)") ----
-    def _get_sneak_dice(member: dict) -> str:
-        feats = member.get("features") or []
-        for f in feats:
-            s = str(f)
-            m = re.search(r"Sneak\s*Attack\s*\((\d+d\d+)\)", s, re.IGNORECASE)
-            if m:
-                return m.group(1)
-        # fallback razonable
-        rl = _rogue_level(member)
-        if rl > 0:
-            return _sneak_dice_from_level(rl)
-        return "1d6"
-
-    
     def _rogue_level(member: dict) -> int:
         lvl = 0
         for c in (member.get("classes") or []):
@@ -2719,7 +2705,7 @@ def tool_execute_actions(script: str, default_target: str = "") -> str:
                 except Exception:
                     pass
         return int(lvl)
-
+    
     def _sneak_dice_from_level(rogue_lvl: int) -> str:
         # tabla 5e
         table = {
@@ -2735,6 +2721,19 @@ def tool_execute_actions(script: str, default_target: str = "") -> str:
             19: "10d6", 20: "10d6",
         }
         return table.get(max(1, min(20, int(rogue_lvl))), "1d6")
+    
+    def _get_sneak_dice(member: dict) -> str:
+        feats = member.get("features") or []
+        for f in feats:
+            s = str(f)
+            m = re.search(r"Sneak\s*Attack\s*\((\d+d\d+)\)", s, re.IGNORECASE)
+            if m:
+                return m.group(1)
+        # fallback razonable
+        rl = _rogue_level(member)
+        if rl > 0:
+            return _sneak_dice_from_level(rl)
+        return "1d6"
 
     # ---- NUEVO: aplicar daño directo a enemigo (porque no hay tool_damage_enemy) ----
     def _apply_enemy_damage(enemy_name: str, amount: int) -> str:
@@ -2864,6 +2863,16 @@ def tool_execute_actions(script: str, default_target: str = "") -> str:
             return dex_mod
         return max(dex_mod, str_mod) if finesse else str_mod
 
+    def _rogue_level(member: dict) -> int:
+        lvl = 0
+        for c in (member.get("classes") or []):
+            if _norm(c.get("name", "")) == "rogue":
+                try:
+                    lvl += int(c.get("level", 0) or 0)
+                except Exception:
+                    pass
+        return int(lvl)
+    
     def _spell_attack_bonus(member: dict) -> int:
         classes = member.get("classes") or []
         main = ""
@@ -2876,7 +2885,7 @@ def tool_execute_actions(script: str, default_target: str = "") -> str:
             if lvl > main_lvl:
                 main_lvl = lvl
                 main = _norm(c.get("name", ""))
-
+    
         ab = member.get("abilities", {}) or {}
         if main in {"wizard", "artificer"}:
             stat_mod = _ability_mod(ab.get("int", 10))
@@ -2886,12 +2895,12 @@ def tool_execute_actions(script: str, default_target: str = "") -> str:
             stat_mod = _ability_mod(ab.get("cha", 10))
         else:
             stat_mod = _ability_mod(ab.get("int", 10))
-
+    
         focus_bonus = 0
         for it in _equipped(member):
             if _is_focus_cd_attack(it):
                 focus_bonus = max(focus_bonus, _weapon_bonus(it))
-
+    
         return _get_prof(member) + stat_mod + focus_bonus
 
     def _fire_bolt_damage(member: dict) -> str:
@@ -3406,6 +3415,34 @@ def _fire_bolt_damage(member: dict) -> str:
         return "2d10"
     return "1d10"
 
+def _infer_sneak_dice(actor_obj: dict) -> str:
+    """
+    Devuelve Nd6 para Sneak Attack:
+    1) intenta leer 'Sneak Attack (Xd6)' en features
+    2) si no, calcula por nivel de Rogue en actor_obj["classes"]
+    3) fallback: 1d6
+    """
+    feats = actor_obj.get("features") or []
+    txt = " ".join(str(x) for x in feats).lower()
+    m = re.search(r"sneak\s*attack\s*\((\d+d6)\)", txt)
+    if m:
+        return m.group(1)
+
+    # cálculo por nivel de pícaro en classes[]
+    rl = 0
+    for c in (actor_obj.get("classes") or []):
+        if _norm(c.get("name", "")) == "rogue":
+            try:
+                rl += int(c.get("level", 0) or 0)
+            except Exception:
+                pass
+
+    # progresión 5e: 1-2=1d6, 3-4=2d6, 5-6=3d6, etc.
+    if rl > 0:
+        dice = max(1, (rl + 1) // 2)
+        return f"{dice}d6"
+
+    return "1d6"
 
 def tool_resolve_actions(plan_json: str) -> str:
     """
@@ -3583,6 +3620,12 @@ def tool_resolve_actions(plan_json: str) -> str:
             modes = {_canon_mode_token(x) for x in modes if str(x).strip()}
             modes = {m for m in modes if m}
 
+            # fallback: si el plan no puso attack_type pero sí modo, infiere
+            if not _norm(a.get("attack_type", "")):
+                if "sharpshooter" in modes:
+                    attack_type = "ranged"
+                elif "gwm" in modes:
+                    attack_type = "melee"
 
             crit_range = int(a.get("crit_range", 20) or 20)
             crit_range = max(2, min(20, crit_range))
@@ -3674,22 +3717,11 @@ def tool_resolve_actions(plan_json: str) -> str:
                     "weapon_tags": weapon_tags,
                     "actor_features_lc": actor_features_lc,
                 }
+
                 to_hit_delta, dmg_bonus_flat, mod_notes = _apply_attack_modifiers(ctx)
-                bonus = int(base_bonus or 0) + to_hit_delta
-                dmg_expr = base_damage_expr
-                dmg_expr = _add_flat_to_damage_expr(dmg_expr, dmg_bonus_flat)
 
-
-                bonus = int(base_bonus or 0) + to_hit_delta
-                # damage expr: sumamos flat a su mod si puede parsearse (nada fancy: asumimos expr simple NdS(+/-)X)
-                # -> para spells tipo Fire Bolt: dmg_bonus_flat no aplica salvo que lo añadas en modifiers.json
-                dmg_expr = base_damage_expr
-                dmg_expr = _add_flat_to_damage_expr(dmg_expr, dmg_bonus_flat)
-                m = _DICE_RE.match((dmg_expr or "").strip().lower().replace(" ", ""))
-                if m:
-                    n_str, sides_str, mod_str = m.groups()
-                    base_mod = int(mod_str.replace(" ", "")) if mod_str else 0
-                    dmg_expr = _format_damage_expr(f"{(n_str or '1')}d{sides_str}", base_mod + dmg_bonus_flat)
+                bonus = int(base_bonus or 0) + int(to_hit_delta or 0)
+                dmg_expr = _add_flat_to_damage_expr(base_damage_expr, int(dmg_bonus_flat or 0))
 
                 # tirada ataque
                 r1 = random.randint(1, 20)
@@ -3733,23 +3765,19 @@ def tool_resolve_actions(plan_json: str) -> str:
                     canon_save(ctmp2)
 
                 # Sneak Attack (1/turn dentro de este resolve)
-                if ("sneak_attack" in modes) and (a_side == "party") and (_norm(actor_name) not in sneak_used_by):
-                sneak_dice = a.get("sneak_dice") or _get_sneak_dice(actor_obj)
-                sneak_dice = str(sneak_dice or "").strip().lower().replace(" ", "")
+                if hit and ("sneak_attack" in modes) and (a_side == "party") and (_norm(actor_name) not in sneak_used_by):
+                    sneak_dice = a.get("sneak_dice") or _infer_sneak_dice(actor_obj)
+                    sneak_dice = str(sneak_dice or "").strip().lower().replace(" ", "")
 
-                # Si no es NdS válido, fallback por nivel de pícaro
-                if not _DICE_RE.match(sneak_dice):
-                    rl = _rogue_level(actor_obj)
-                    sneak_dice = _sneak_dice_from_level(rl) if rl > 0 else "1d6"
+                    if not _DICE_RE.match(sneak_dice):
+                        sneak_dice = "1d6"
 
-                # Sneak Attack critéea si el ataque fue crítico
-                sa_roll = _roll_damage_expr(sneak_dice, crit=is_crit)
-                out.append("    SNEAK: " + sa_roll["text"])
-                out.append("    " + tool_damage(target_name, int(sa_roll["total"])))
-
-                    sa_roll = _roll_damage_expr(str(sneak_dice), crit=is_crit)
+                    # si el ataque fue crítico, _roll_damage_expr(..., crit=True) ya duplica dados
+                    sa_roll = _roll_damage_expr(sneak_dice, crit=is_crit)
                     out.append("    SNEAK: " + sa_roll["text"])
                     out.append("    " + tool_damage(target_name, int(sa_roll["total"])))
+
+                    sneak_used_by.add(_norm(actor_name))
 
             continue
 
