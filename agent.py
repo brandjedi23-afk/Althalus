@@ -5695,6 +5695,11 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
                 state.history.append(_assistant_msg(text))
                 return text
 
+            # recorta cualquier “menú” después de la pregunta final
+            q = "¿Qué hacéis?"
+            if q in final:
+                final = final[:final.rfind(q) + len(q)]
+
             return "(Sin salida de texto; revisa el prompt/tools.)"
     finally:
         _ACTIVE_STATE = None
