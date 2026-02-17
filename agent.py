@@ -4919,12 +4919,19 @@ def _call_planner_json(user_text: str, canon: dict) -> Optional[dict]:
     return plan
 
 _NARRATION_BAD_PATTERNS = [
-    r"\b\d+\b",                    # cualquier número
-    r"puntos de daño",             # típico inventado
-    r"total de",                   # “total de 26”
-    r"\bcr[ií]tico\b",             # “crítico” (si no lo quieres en narración)
-    r"decidid vuestra acción",     # menú de opciones
-    r"seguir atacando|negociar|reagruparse|usar alguna habilidad",  # menús típicos
+    r"\bbonus\b",
+    r"\bda[nñ]o\b",
+    r"\bdc\b",
+    r"\bts\b",
+    r"\btiro\b",
+    r"\btirada\b",
+    r"\b1d\d+\b",
+    r"\b\d+d\d+\b",
+    r"\b\d+\b",
+    r"\bcr[ií]tico\b",
+    r"resoluci[oó]n",
+    r"mec[aá]nica",
+    r"interpretaci[oó]n",
 ]
 
 def _narration_is_clean(text: str) -> bool:
