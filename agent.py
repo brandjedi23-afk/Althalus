@@ -4319,9 +4319,17 @@ Reglas:
 """
 
 NARRATOR_SYSTEM = """
-Eres un Director de Juego de D&D 5e. Vas a narrar el resultado de una resolución ya ejecutada por el motor.
-NO repitas tiradas ni inventes resultados mecánicos: eso ya está en la sección RESOLUCIÓN que pondrá el sistema.
-Tu tarea: narración clara, cinematográfica y coherente, y terminar preguntando “¿qué hacéis ahora?”.
+Eres un Director de Juego de D&D 5e. Vas a narrar el resultado de una resolución YA ejecutada por el motor.
+
+REGLAS DURAS:
+- NO inventes tiradas, críticos, totales de daño, ni números (prohibido usar dígitos 0-9).
+- NO ofrezcas listas de opciones (“seguimos atacando / negociar / reagruparse…”) salvo que el usuario te pida explícitamente opciones.
+- NO cambies quién hace qué: usa EXACTAMENTE los actores y objetivos del PLAN.
+- Puedes describir el impacto de forma cualitativa (“impacta”, “falla”, “queda tambaleante”), pero sin cifras.
+
+Tu salida:
+- 1-3 párrafos de narración cinematográfica y coherente
+- 1 pregunta final abierta: “¿Qué hacéis ahora?”
 """
 
 ESTILO_RULES = """
@@ -4383,7 +4391,7 @@ class AgentState:
     })
 
     # Flags generales de campaña (decisiones, puertas abiertas, PNJ hostiles, etc.)
-    flags: Dict[str, Any] = field(default_factory=dict)
+    flags: Dict[str, Any] = field(default_factory=lambda: {"debug_mechanics": True})
 
     # Progreso del módulo (si se usa)
     module_progress: Dict[str, Any] = field(default_factory=lambda: {
@@ -4572,6 +4580,27 @@ def _canon_snapshot_for_planner(canon: dict, *, max_feats: int = 10) -> dict:
 
     return snap
 
+def _enemy_status_summary(canon: dict, limit: int = 12) -> str:
+    enemies = canon.get("enemies", {}) or {}
+    lines = []
+    for name, e in enemies.items():
+        if not isinstance(e, dict):
+            continue
+        hp = e.get("hp_current", e.get("hp", None))
+        mx = e.get("max_hp", e.get("hp_max", None))
+        if hp is None or mx is None:
+            continue
+        try:
+            hp_i = int(hp)
+            mx_i = int(mx)
+        except Exception:
+            continue
+        conds = [c.get("name") for c in _ensure_conditions(e) if isinstance(c, dict) and c.get("name")]
+        cond_txt = f" ({', '.join(conds)})" if conds else ""
+        lines.append(f"- {name}: {hp_i}/{mx_i} PV{cond_txt}")
+        if len(lines) >= limit:
+            break
+    return "\n".join(lines).strip()
 
 def _call_planner_json(user_text: str, canon: dict) -> Optional[dict]:
     """
@@ -4615,6 +4644,23 @@ def _call_planner_json(user_text: str, canon: dict) -> Optional[dict]:
 
     return plan
 
+_NARRATION_BAD_PATTERNS = [
+    r"\b\d+\b",                    # cualquier número
+    r"puntos de daño",             # típico inventado
+    r"total de",                   # “total de 26”
+    r"\bcr[ií]tico\b",             # “crítico” (si no lo quieres en narración)
+    r"decidid vuestra acción",     # menú de opciones
+    r"seguir atacando|negociar|reagruparse|usar alguna habilidad",  # menús típicos
+]
+
+def _narration_is_clean(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip().lower()
+    for pat in _NARRATION_BAD_PATTERNS:
+        if re.search(pat, t, re.IGNORECASE):
+            return False
+    return True
 
 def _call_narrator_text(user_text: str, canon_after: dict, plan: dict, resolution_text: str) -> str:
     """
@@ -4632,12 +4678,47 @@ def _call_narrator_text(user_text: str, canon_after: dict, plan: dict, resolutio
         }
     ]
 
+    # 1er intento
     resp = client.chat.completions.create(
         model=_require_model(),
         messages=messages,
-        temperature=0.6,
+        temperature=0.5,
     )
-    return (resp.choices[0].message.content or "").strip()
+    txt = (resp.choices[0].message.content or "").strip()
+
+    if _narration_is_clean(txt):
+        return txt
+
+    # 2º intento (más estricto)
+    messages2 = messages + [{
+        "role": "system",
+        "content": "SEGUNDO INTENTO: recuerda que está PROHIBIDO incluir números (0-9), totales, críticos explícitos o menús de opciones. Solo narración cualitativa + una pregunta final abierta."
+    }]
+    resp2 = client.chat.completions.create(
+        model=_require_model(),
+        messages=messages2,
+        temperature=0.2,
+    )
+    txt2 = (resp2.choices[0].message.content or "").strip()
+
+    # Si aun así no cumple, devolvemos una versión saneada (último recurso)
+    if _narration_is_clean(txt2):
+        return txt2
+
+    # Sanitizado mínimo: eliminar líneas con dígitos/listas
+    lines = []
+    for line in (txt2 or txt or "").splitlines():
+        if re.search(r"\d", line):
+            continue
+        if re.search(r"seguir atacando|negociar|reagruparse|decidid", line, re.IGNORECASE):
+            continue
+        lines.append(line)
+    cleaned = "\n".join([l for l in lines if l.strip()]).strip()
+
+    if not cleaned:
+        cleaned = "La escena se resuelve en un intercambio rápido y brutal. Los bandoleros vacilan, heridos, pero aún peligrosos.\n\n¿Qué hacéis ahora?"
+    return cleaned
+
 
 def _parse_tool_args(args_raw: Any) -> dict:
     if isinstance(args_raw, dict):
@@ -5118,7 +5199,20 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
                 # Narración (solo texto)
                 narr = _call_narrator_text(user_text, canon_after, plan, resolution)
 
-                final = "RESOLUCIÓN (mecánica)\n```text\n" + resolution + "\n```\n\n" + (narr or "").strip()
+                status = _enemy_status_summary(canon_after)
+                status_block = ("ESTADO (post-resolución)\n```text\n" + status + "\n```\n\n") if status else ""
+
+                # Si quieres ocultar mecánica por defecto, pon debug_mechanics=False en state.flags
+                debug_mech = bool(getattr(state, "flags", {}).get("debug_mechanics", False))
+
+                if debug_mech:
+                    final = (
+                        "RESOLUCIÓN (mecánica)\n```text\n" + resolution + "\n```\n\n"
+                        + status_block
+                        + (narr or "").strip()
+                    )
+                else:
+                    final = status_block + (narr or "").strip()
 
                 # Persistir en history para continuidad
                 state.history.append(_assistant_msg(final))
