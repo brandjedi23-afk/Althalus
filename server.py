@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from wot_dice import roll_expr, skill_check as _skill_check, attack_roll as _attack_roll
 
 # (No es estrictamente necesario aquí, pero lo dejas importado si lo usas en otros sitios)
-from wot_output import TurnContext, format_turn_output  # noqa: F401
+from wot_output import TurnContext, format_turn_output
 
 # -----------------------------
 # Paths estables + .env
@@ -175,21 +175,6 @@ def roll_endpoint(req: RollReq):
         )
 
     return {"total": r.total, "detail": r.detail, "text": text, "raw": r.raw}
-
-
-@app.post("/skill_check", operation_id="skillCheck")
-def skill_check_endpoint(req: SkillCheckReq):
-    ok, total, txt, raw = _skill_check(bonus=req.bonus, dc=req.dc, mode=req.mode)
-    text = f"{req.label + ': ' if req.label else ''}{txt}"
-
-    if req.session_id:
-        _append_session_event(
-            req.session_id,
-            "skill_check",
-            {"bonus": req.bonus, "dc": req.dc, "mode": req.mode, "ok": ok, "total": total, "label": req.label},
-        )
-
-    return {"ok": ok, "total": total, "text": text, "raw": raw}
 
 
 @app.post("/attack", operation_id="attack")
