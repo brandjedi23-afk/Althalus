@@ -1,0 +1,1644 @@
+[1mdiff --git a/agent.py b/agent.py[m
+[1mindex 3766ccf..5621776 100644[m
+[1m--- a/agent.py[m
+[1m+++ b/agent.py[m
+[36m@@ -3,6 +3,7 @@[m [mimport time[m
+ import json[m
+ import re[m
+ import random[m
+[32m+[m[32mimport difflib[m
+ from dataclasses import dataclass, field[m
+ from typing import Any, Dict, List, Optional, Tuple, Callable, Set[m
+ import inspect[m
+[36m@@ -650,6 +651,9 @@[m [mdef _ensure_enemy_stub_anywhere(canon: dict, name: str, defaults: dict | None =[m
+     """[m
+     Garantiza que exista canon['enemies'][name]. Útil cuando el LLM narra enemigos[m
+     sin registrarlos previamente. Devuelve True si existe o se creó.[m
+[32m+[m
+[32m+[m[32m    IMPORTANTE: los stubs ya NO usan HP=999 (eso rompe la consistencia). Usamos valores[m
+[32m+[m[32m    modestos y marcamos stub=True para que luego pueda “enriquecerse” vía bestiary/spawn.[m
+     """[m
+     name = (name or "").strip()[m
+     if not name:[m
+[36m@@ -662,22 +666,61 @@[m [mdef _ensure_enemy_stub_anywhere(canon: dict, name: str, defaults: dict | None =[m
+     canon.setdefault("enemies", {})[m
+     enemies = canon["enemies"][m
+ [m
+[32m+[m[32m    def _hp_defaults() -> tuple[int, int]:[m
+[32m+[m[32m        # Defaults razonables para un “desconocido”[m
+[32m+[m[32m        return (10, 10)  # (hp_current, max_hp)[m
+[32m+[m
+     if name in enemies:[m
+[31m-        # asegurar campos mínimos[m
+[31m-        enemies[name].setdefault("name", name)[m
+[31m-        enemies[name].setdefault("conditions", [])[m
+[31m-        enemies[name].setdefault("ac", 10)[m
+[31m-        enemies[name].setdefault("hp", 999)[m
+[31m-        enemies[name].setdefault("hp_max", enemies[name].get("hp", 999))[m
+[32m+[m[32m        e = enemies[name][m
+[32m+[m[32m        e.setdefault("name", name)[m
+[32m+[m[32m        e.setdefault("conditions", [])[m
+[32m+[m[32m        e.setdefault("ac", 10)[m
+[32m+[m
+[32m+[m[32m        # Unificar runtime HP[m
+[32m+[m[32m        hp_cur = e.get("hp_current", e.get("hp", None))[m
+[32m+[m[32m        hp_max = e.get("max_hp", e.get("hp_max", None))[m
+[32m+[m[32m        if hp_cur is None or hp_max is None:[m
+[32m+[m[32m            dcur, dmax = _hp_defaults()[m
+[32m+[m[32m            hp_cur = dcur if hp_cur is None else hp_cur[m
+[32m+[m[32m            hp_max = dmax if hp_max is None else hp_max[m
+[32m+[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            hp_cur_i = int(hp_cur)[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            hp_cur_i = _hp_defaults()[0][m
+[32m+[m[32m        try:[m
+[32m+[m[32m            hp_max_i = int(hp_max)[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            hp_max_i = max(hp_cur_i, _hp_defaults()[1])[m
+[32m+[m
+[32m+[m[32m        e["hp_current"] = max(0, hp_cur_i)[m
+[32m+[m[32m        e["max_hp"] = max(1, hp_max_i)[m
+[32m+[m
+[32m+[m[32m        # Mantener compatibilidad con claves antiguas[m
+[32m+[m[32m        e["hp"] = e["hp_current"][m
+[32m+[m[32m        e["hp_max"] = e["max_hp"][m
+[32m+[m
+[32m+[m[32m        # Si no estaba marcado, que siga indicando stub si no tiene source[m
+[32m+[m[32m        e.setdefault("stub", True)[m
+[32m+[m
+[32m+[m[32m        # aplicar defaults extra si vienen[m
+[32m+[m[32m        if defaults and isinstance(defaults, dict):[m
+[32m+[m[32m            for k, v in defaults.items():[m
+[32m+[m[32m                if v is not None:[m
+[32m+[m[32m                    e[k] = v[m
+[32m+[m
+         canon_save(canon)[m
+         return True[m
+ [m
+[32m+[m[32m    dcur, dmax = _hp_defaults()[m
+     stub = {[m
+         "name": name,[m
+         "stub": True,[m
+         "ac": 10,[m
+[31m-        "hp": 999,[m
+[31m-        "hp_max": 999,[m
+[32m+[m[32m        "hp_current": dcur,[m
+[32m+[m[32m        "max_hp": dmax,[m
+[32m+[m[32m        "hp": dcur,       # compat[m
+[32m+[m[32m        "hp_max": dmax,   # compat[m
+         "conditions": [],[m
+     }[m
+     if defaults and isinstance(defaults, dict):[m
+[36m@@ -691,6 +734,8 @@[m [mdef _ensure_enemy_stub_from_combat(canon: dict, target: str) -> bool:[m
+     """[m
+     Si hay combate activo y el target está en la iniciativa con side != party,[m
+     crea un enemigo stub en canon['enemies'] para permitir ataques/condiciones.[m
+[32m+[m
+[32m+[m[32m    IMPORTANTE: los stubs ya NO usan HP=999 (eso rompe la consistencia).[m
+     """[m
+     combat = canon.get("combat", {}) or {}[m
+     if not combat.get("active"):[m
+[36m@@ -713,13 +758,14 @@[m [mdef _ensure_enemy_stub_from_combat(canon: dict, target: str) -> bool:[m
+             if name in enemies:[m
+                 return True[m
+ [m
+[31m-            # crear stub (valores por defecto + marca)[m
+             enemies[name] = {[m
+                 "name": name,[m
+                 "stub": True,[m
+                 "ac": 10,[m
+[31m-                "hp": 999,[m
+[31m-                "hp_max": 999,[m
+[32m+[m[32m                "hp_current": 10,[m
+[32m+[m[32m                "max_hp": 10,[m
+[32m+[m[32m                "hp": 10,        # compat[m
+[32m+[m[32m                "hp_max": 10,    # compat[m
+                 "conditions": [],[m
+             }[m
+             canon_save(canon)[m
+[36m@@ -909,6 +955,181 @@[m [mdef _get_monster_def_by_name(name: str) -> Optional[dict]:[m
+         return None[m
+     return (comp.get("monsters") or {}).get(monster_id)[m
+ [m
+[32m+[m[32m# =========================================================[m
+[32m+[m[32m# Bestiary helpers (compendio) — match flexible + normalización[m
+[32m+[m[32m# =========================================================[m
+[32m+[m
+[32m+[m[32m# Alias ES -> EN mínimo (ampliable). Solo se aplica al primer token.[m
+[32m+[m[32m_MONSTER_FIRSTWORD_ALIASES = {[m
+[32m+[m[32m    "cultista": "cultist",[m
+[32m+[m[32m    "bandido": "bandit",[m
+[32m+[m[32m    "guardia": "guard",[m
+[32m+[m[32m    "capitán": "captain",[m
+[32m+[m[32m    "capitan": "captain",[m
+[32m+[m[32m    "acólito": "acolyte",[m
+[32m+[m[32m    "acolito": "acolyte",[m
+[32m+[m[32m    "lobo": "wolf",[m
+[32m+[m[32m    "oso": "bear",[m
+[32m+[m[32m    "orco": "orc",[m
+[32m+[m[32m    "trol": "troll",[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mdef _monster_alias_candidates(name: str) -> list[str]:[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Genera candidatos de nombre para mejorar el match con bestiary (ES->EN básico).[m
+[32m+[m[32m    """[m
+[32m+[m[32m    name = (name or "").strip()[m
+[32m+[m[32m    if not name:[m
+[32m+[m[32m        return [][m
+[32m+[m[32m    parts = name.split()[m
+[32m+[m[32m    if not parts:[m
+[32m+[m[32m        return [name][m
+[32m+[m[32m    first = parts[0].lower()[m
+[32m+[m[32m    if first in _MONSTER_FIRSTWORD_ALIASES:[m
+[32m+[m[32m        parts2 = [_MONSTER_FIRSTWORD_ALIASES[first]] + parts[1:][m
+[32m+[m[32m        return [name, " ".join(parts2)][m
+[32m+[m[32m    return [name][m
+[32m+[m
+[32m+[m[32mdef _strip_instance_suffix(name: str) -> str:[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Quita sufijos típicos de “instancia”: 'A', '#2', '2', etc.[m
+[32m+[m[32m    Ej: 'Cultist A' -> 'Cultist', 'Goblin #2' -> 'Goblin'[m
+[32m+[m[32m    """[m
+[32m+[m[32m    s = (name or "").strip()[m
+[32m+[m[32m    if not s:[m
+[32m+[m[32m        return s[m
+[32m+[m[32m    # 'X #2' o 'X 2'[m
+[32m+[m[32m    s = re.sub(r"\s+#\d+\s*$", "", s)[m
+[32m+[m[32m    s = re.sub(r"\s+\d+\s*$", "", s)[m
+[32m+[m[32m    # 'X A' / 'X B'[m
+[32m+[m[32m    s = re.sub(r"\s+[A-Z]\s*$", "", s)[m
+[32m+[m[32m    return s.strip()[m
+[32m+[m
+[32m+[m[32mdef _get_monster_def_fuzzy(name: str) -> Optional[dict]:[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Busca un monstruo en el compendio por:[m
+[32m+[m[32m      - match exacto en indexes.by_name[m
+[32m+[m[32m      - match quitando sufijos (A/#2)[m
+[32m+[m[32m      - match por alias ES->EN básico[m
+[32m+[m[32m      - match difuso (difflib) sobre indexes.by_name[m
+[32m+[m[32m    """[m
+[32m+[m[32m    comp = get_bestiary()[m
+[32m+[m[32m    if not comp or not name:[m
+[32m+[m[32m        return None[m
+[32m+[m[32m    idx = (comp.get("indexes") or {}).get("by_name") or {}[m
+[32m+[m[32m    monsters = (comp.get("monsters") or {})[m
+[32m+[m
+[32m+[m[32m    # 1) exacto / por variantes[m
+[32m+[m[32m    candidates = [][m
+[32m+[m[32m    for base in _monster_alias_candidates(name):[m
+[32m+[m[32m        candidates.append(base)[m
+[32m+[m[32m        candidates.append(_strip_instance_suffix(base))[m
+[32m+[m
+[32m+[m[32m    for cand in candidates:[m
+[32m+[m[32m        mid = idx.get(_norm(cand))[m
+[32m+[m[32m        if mid and mid in monsters:[m
+[32m+[m[32m            return monsters[mid][m
+[32m+[m
+[32m+[m[32m    # 2) difuso[m
+[32m+[m[32m    keys = list(idx.keys())[m
+[32m+[m[32m    for cand in candidates:[m
+[32m+[m[32m        nn = _norm(cand)[m
+[32m+[m[32m        close = difflib.get_close_matches(nn, keys, n=1, cutoff=0.84)[m
+[32m+[m[32m        if close:[m
+[32m+[m[32m            mid = idx.get(close[0])[m
+[32m+[m[32m            if mid and mid in monsters:[m
+[32m+[m[32m                return monsters[mid][m
+[32m+[m
+[32m+[m[32m    return None[m
+[32m+[m
+[32m+[m[32mdef _import_monster_as_enemy(mon: dict, instance_name: str) -> dict:[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Convierte un statblock del bestiary a un enemigo “runtime” estable en canon['enemies'].[m
+[32m+[m[32m    Unifica HP en: max_hp + hp_current (+ compat: hp/hp_max).[m
+[32m+[m[32m    """[m
+[32m+[m[32m    # AC[m
+[32m+[m[32m    ac_raw = mon.get("ac", 10)[m
+[32m+[m[32m    ac = 10[m
+[32m+[m[32m    if isinstance(ac_raw, list) and ac_raw:[m
+[32m+[m[32m        first = ac_raw[0][m
+[32m+[m[32m        if isinstance(first, dict) and "ac" in first:[m
+[32m+[m[32m            ac = int(first.get("ac") or 10)[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            try:[m
+[32m+[m[32m                ac = int(first)[m
+[32m+[m[32m            except Exception:[m
+[32m+[m[32m                ac = 10[m
+[32m+[m[32m    else:[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            ac = int(ac_raw)[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            ac = 10[m
+[32m+[m
+[32m+[m[32m    # HP[m
+[32m+[m[32m    hp_raw = mon.get("hp", 10)[m
+[32m+[m[32m    max_hp = 10[m
+[32m+[m[32m    if isinstance(hp_raw, dict):[m
+[32m+[m[32m        # tu compendio usa 'avg'; soportamos 'average' también[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            max_hp = int(hp_raw.get("avg") or hp_raw.get("average") or 10)[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            max_hp = 10[m
+[32m+[m[32m    elif isinstance(hp_raw, str):[m
+[32m+[m[32m        # formatos tipo "45 (6d8+18)"[m
+[32m+[m[32m        m = re.match(r"^\s*(\d+)", hp_raw)[m
+[32m+[m[32m        if m:[m
+[32m+[m[32m            max_hp = int(m.group(1))[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            max_hp = 10[m
+[32m+[m[32m    else:[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            max_hp = int(hp_raw)[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            max_hp = 10[m
+[32m+[m
+[32m+[m[32m    max_hp = max(1, int(max_hp))[m
+[32m+[m
+[32m+[m[32m    entry = {[m
+[32m+[m[32m        "name": instance_name,[m
+[32m+[m[32m        "stub": False,[m
+[32m+[m[32m        "source": "bestiary",[m
+[32m+[m[32m        "_bestiary_name": str(mon.get("name") or instance_name),[m
+[32m+[m[32m        "ac": ac,[m
+[32m+[m
+[32m+[m[32m        # runtime HP unificado[m
+[32m+[m[32m        "max_hp": max_hp,[m
+[32m+[m[32m        "hp_current": max_hp,[m
+[32m+[m
+[32m+[m[32m        # compat keys (hay funciones que aún leen estas)[m
+[32m+[m[32m        "hp": max_hp,[m
+[32m+[m[32m        "hp_max": max_hp,[m
+[32m+[m
+[32m+[m[32m        "conditions": [],[m
+[32m+[m[32m        "speed": _speed_to_int(mon.get("speed", 30), default_speed=30),[m
+[32m+[m[32m        "move_left": 0,[m
+[32m+[m
+[32m+[m[32m        # guardar referencia mínima para auditoría / futuros tools[m
+[32m+[m[32m        "raw": mon,[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    # CR si existe[m
+[32m+[m[32m    if "cr" in mon:[m
+[32m+[m[32m        cr_val = _parse_cr(mon.get("cr"))[m
+[32m+[m[32m        if cr_val is not None:[m
+[32m+[m[32m            entry["cr"] = cr_val[m
+[32m+[m
+[32m+[m[32m    # Abilities si existen como keys[m
+[32m+[m[32m    abil = {}[m
+[32m+[m[32m    for k in ["str", "dex", "con", "int", "wis", "cha"]:[m
+[32m+[m[32m        if k in mon:[m
+[32m+[m[32m            try:[m
+[32m+[m[32m                abil[k] = int(mon.get(k))[m
+[32m+[m[32m            except Exception:[m
+[32m+[m[32m                pass[m
+[32m+[m[32m    if abil:[m
+[32m+[m[32m        entry["abilities"] = abil[m
+[32m+[m
+[32m+[m[32m    return entry[m
+ [m
+ def _has_condition(obj: dict, name: str) -> bool:[m
+     name = (name or "").upper()[m
+[36m@@ -1641,22 +1862,12 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+     Registra enemigos en canon['enemies'] sin necesidad de iniciar combate.[m
+ [m
+     Entrada (JSON string) aceptada:[m
+[31m-    - ["Cultista A", "Cultista B"][m
+[31m-    - [{"name":"Cultista A","ac":12,"hp":27}, {"name":"Encapuchado Oscuro","ac":14}][m
+[32m+[m[32m    - ["Cultist A", "Cultist B"][m
+[32m+[m[32m    - [{"name":"Cultist A","ac":12,"hp":27}, {"name":"Encapuchado Oscuro","ac":14}][m
+     - {"enemies":[...]}  (lista como arriba)[m
+ [m
+[31m-    Además, si vienen estos campos, también los guarda:[m
+[31m-    - role, level, cr[m
+[31m-    - abilities: {str,dex,con,int,wis,cha}[m
+[31m-    - skills: {"Stealth":5,"Perception":3} o lista[m
+[31m-    - saves: {"DEX":4,"WIS":2} o lista[m
+[31m-    - attacks: lista de ataques (texto libre o dicts)[m
+[31m-    - spells: lista de conjuros (strings)[m
+[31m-    - features: lista de rasgos (strings)[m
+[31m-    - tags: lista de etiquetas[m
+[31m-    - notes: texto libre[m
+[31m-    - source: "generated"/"bestiary"/...[m
+[31m-    - stub: bool[m
+[32m+[m[32m    NUEVO:[m
+[32m+[m[32m    - Si el nombre (o template) coincide con bestiary, importa AC/HP y marca stub=False por defecto.[m
+ [m
+     Devuelve un resumen de creados/actualizados/ignorados.[m
+     """[m
+[36m@@ -1707,7 +1918,6 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+         if isinstance(v, str):[m
+             s = v.strip()[m
+             return [s] if s else [][m
+[31m-        # dict u otros -> encapsular[m
+         return [v][m
+ [m
+     def _as_dict(v):[m
+[36m@@ -1733,11 +1943,34 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+             ignored.append(f"{name} (es party)")[m
+             continue[m
+ [m
+[31m-        # Defaults mínimos[m
+[31m-        ac = _as_int(payload.get("ac"), 10)[m
+[31m-        hp = _as_int(payload.get("hp"), 999)[m
+[31m-        hp_max = _as_int(payload.get("hp_max"), hp)[m
+[31m-        stub = bool(payload.get("stub", True))[m
+[32m+[m[32m        template = str(payload.get("template", "") or "").strip()[m
+[32m+[m
+[32m+[m[32m        # Defaults (si hay bestiary, mejor)[m
+[32m+[m[32m        mon_def = _get_monster_def_fuzzy(template) if template else None[m
+[32m+[m[32m        if not mon_def:[m
+[32m+[m[32m            mon_def = _get_monster_def_fuzzy(name)[m
+[32m+[m
+[32m+[m[32m        if mon_def:[m
+[32m+[m[32m            base_entry = _import_monster_as_enemy(mon_def, name)[m
+[32m+[m[32m            default_ac = int(base_entry.get("ac", 10))[m
+[32m+[m[32m            default_max_hp = int(base_entry.get("max_hp", 10))[m
+[32m+[m[32m            default_stub = False[m
+[32m+[m[32m            default_source = "bestiary"[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            default_ac = 10[m
+[32m+[m[32m            default_max_hp = 10[m
+[32m+[m[32m            default_stub = True[m
+[32m+[m[32m            default_source = "generated"[m
+[32m+[m
+[32m+[m[32m        # Aplicar overrides del payload si vienen[m
+[32m+[m[32m        ac = _as_int(payload.get("ac"), default_ac)[m
+[32m+[m[32m        max_hp = _as_int(payload.get("hp"), default_max_hp)[m
+[32m+[m[32m        max_hp = _as_int(payload.get("hp_max"), max_hp)[m
+[32m+[m[32m        max_hp = _as_int(payload.get("max_hp"), max_hp)[m
+[32m+[m[32m        hp_current = _as_int(payload.get("hp_current"), max_hp)[m
+[32m+[m
+[32m+[m[32m        stub = bool(payload.get("stub", default_stub))[m
+[32m+[m[32m        source_s = str(payload.get("source", default_source)).strip() if payload.get("source", default_source) is not None else default_source[m
+ [m
+         # Campos “ricos” opcionales[m
+         role = payload.get("role")[m
+[36m@@ -1751,7 +1984,6 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+         features = payload.get("features")[m
+         tags = payload.get("tags")[m
+         notes = payload.get("notes")[m
+[31m-        source = payload.get("source")[m
+ [m
+         # Normalizar tipos[m
+         level_i = _as_int(level, None) if level is not None else None[m
+[36m@@ -1764,44 +1996,51 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+         features_l = _as_list(features) if features is not None else None[m
+         tags_l = _as_list(tags) if tags is not None else None[m
+         notes_s = str(notes).strip() if notes is not None else None[m
+[31m-        source_s = str(source).strip() if source is not None else None[m
+         role_s = str(role).strip() if role is not None else None[m
+ [m
+         if name not in enemies:[m
+[31m-            enemies[name] = {[m
+[32m+[m[32m            # base from bestiary if exists (pero dejamos que payload sobrescriba abajo)[m
+[32m+[m[32m            entry = {}[m
+[32m+[m[32m            if mon_def:[m
+[32m+[m[32m                entry.update(_import_monster_as_enemy(mon_def, name))[m
+[32m+[m
+[32m+[m[32m            entry.update({[m
+                 "name": name,[m
+                 "stub": stub,[m
+                 "ac": ac,[m
+[31m-                "hp": hp,[m
+[31m-                "hp_max": hp_max,[m
+[32m+[m[32m                "max_hp": max(1, int(max_hp)),[m
+[32m+[m[32m                "hp_current": max(0, int(hp_current)),[m
+[32m+[m[32m                "hp": max(0, int(hp_current)),          # compat[m
+[32m+[m[32m                "hp_max": max(1, int(max_hp)),          # compat[m
+                 "conditions": [],[m
+[31m-            }[m
+[32m+[m[32m                "source": source_s,[m
+[32m+[m[32m            })[m
+[32m+[m
+             # Añadir “ricos” si vienen[m
+             if role_s is not None:[m
+[31m-                enemies[name]["role"] = role_s[m
+[32m+[m[32m                entry["role"] = role_s[m
+             if level_i is not None:[m
+[31m-                enemies[name]["level"] = level_i[m
+[32m+[m[32m                entry["level"] = level_i[m
+             if cr_f is not None:[m
+[31m-                enemies[name]["cr"] = cr_f[m
+[32m+[m[32m                entry["cr"] = cr_f[m
+             if abilities_d:[m
+[31m-                enemies[name]["abilities"] = abilities_d[m
+[32m+[m[32m                entry["abilities"] = abilities_d[m
+             if skills_d is not None:[m
+[31m-                enemies[name]["skills"] = skills_d[m
+[32m+[m[32m                entry["skills"] = skills_d[m
+             if saves_d is not None:[m
+[31m-                enemies[name]["saves"] = saves_d[m
+[32m+[m[32m                entry["saves"] = saves_d[m
+             if attacks_l is not None:[m
+[31m-                enemies[name]["attacks"] = attacks_l[m
+[32m+[m[32m                entry["attacks"] = attacks_l[m
+             if spells_l is not None:[m
+[31m-                enemies[name]["spells"] = spells_l[m
+[32m+[m[32m                entry["spells"] = spells_l[m
+             if features_l is not None:[m
+[31m-                enemies[name]["features"] = features_l[m
+[32m+[m[32m                entry["features"] = features_l[m
+             if tags_l is not None:[m
+[31m-                enemies[name]["tags"] = tags_l[m
+[32m+[m[32m                entry["tags"] = tags_l[m
+             if notes_s is not None:[m
+[31m-                enemies[name]["notes"] = notes_s[m
+[31m-            if source_s is not None:[m
+[31m-                enemies[name]["source"] = source_s[m
+[32m+[m[32m                entry["notes"] = notes_s[m
+ [m
+[32m+[m[32m            enemies[name] = entry[m
+             created.append(name)[m
+ [m
+         else:[m
+[36m@@ -1809,15 +2048,23 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+             eobj.setdefault("name", name)[m
+             eobj.setdefault("conditions", [])[m
+ [m
+[31m-            # sobrescribir solo si viene en payload[m
+[32m+[m[32m            # sobrescribir solo si viene en payload (o si es stub y hay bestiary)[m
+[32m+[m[32m            if mon_def and eobj.get("stub") and not payload.get("stub", None):[m
+[32m+[m[32m                # “enriquece” un stub con bestiary si no te lo han bloqueado explícitamente[m
+[32m+[m[32m                eobj.update(_import_monster_as_enemy(mon_def, name))[m
+[32m+[m
+             if "ac" in payload:[m
+                 eobj["ac"] = ac[m
+[31m-            if "hp" in payload:[m
+[31m-                eobj["hp"] = hp[m
+[31m-            if "hp_max" in payload:[m
+[31m-                eobj["hp_max"] = hp_max[m
+[32m+[m[32m            if any(k in payload for k in ["hp", "hp_max", "max_hp", "hp_current"]):[m
+[32m+[m[32m                eobj["max_hp"] = max(1, int(max_hp))[m
+[32m+[m[32m                eobj["hp_current"] = max(0, int(hp_current))[m
+[32m+[m[32m                eobj["hp"] = eobj["hp_current"][m
+[32m+[m[32m                eobj["hp_max"] = eobj["max_hp"][m
+[32m+[m
+             if "stub" in payload:[m
+                 eobj["stub"] = stub[m
+[32m+[m[32m            if "source" in payload:[m
+[32m+[m[32m                eobj["source"] = source_s[m
+ [m
+             if role_s is not None and "role" in payload:[m
+                 eobj["role"] = role_s[m
+[36m@@ -1841,8 +2088,6 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+                 eobj["tags"] = tags_l[m
+             if notes is not None and "notes" in payload:[m
+                 eobj["notes"] = notes_s[m
+[31m-            if source is not None and "source" in payload:[m
+[31m-                eobj["source"] = source_s[m
+ [m
+             updated.append(name)[m
+ [m
+[36m@@ -1859,21 +2104,20 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+ def tool_spawn_encounter(encounter_json: str) -> str:[m
+     """[m
+     Crea enemigos con stats jugables.[m
+[31m-    - Si encuentra coincidencia en bestiary.json (por name o by_key), importa stats.[m
+[32m+[m[32m    - Si encuentra coincidencia en bestiary.json (compendio: indexes.by_name + monsters{}), importa stats.[m
+     - Si no, genera stats por role + cr/level.[m
+ [m
+     Entrada JSON (string):[m
+     {[m
+       "enemies": [[m
+[31m-        {"name":"Cultista A","template":"cultist","cr":0.25},[m
+[31m-        {"name":"Cultista B","template":"cultist","cr":0.25},[m
+[31m-        {"name":"Cultista C","template":"cultist","cr":0.25},[m
+[32m+[m[32m        {"name":"Cultist A","template":"cultist","cr":0.25},[m
+[32m+[m[32m        {"name":"Cultist B","template":"cultist","cr":0.25},[m
+         {"name":"Encapuchado Oscuro","role":"caster","cr":3, "spells":["Hold Person","Magic Missile"]}[m
+       ][m
+     }[m
+     """[m
+     try:[m
+[31m-        data = json.loads(encounter_json)[m
+[32m+[m[32m        data = json.loads(encounter_json) if isinstance(encounter_json, str) else encounter_json[m
+     except Exception as e:[m
+         return f"Error: encounter_json no es JSON válido: {e}"[m
+ [m
+[36m@@ -1885,32 +2129,6 @@[m [mdef tool_spawn_encounter(encounter_json: str) -> str:[m
+     canon.setdefault("enemies", {})[m
+     enemies = canon["enemies"][m
+ [m
+[31m-    # --- cargar bestiary.json una vez ---[m
+[31m-    ROOT = Path(__file__).resolve().parent[m
+[31m-    bestiary_path = ROOT / "dm" / "bestiary.json"[m
+[31m-    bestiary = {}[m
+[31m-    if bestiary_path.exists():[m
+[31m-        try:[m
+[31m-            bestiary = json.loads(bestiary_path.read_text(encoding="utf-8"))[m
+[31m-        except Exception:[m
+[31m-            bestiary = {}[m
+[31m-[m
+[31m-    # Índice simple por nombre (case-insensitive)[m
+[31m-    by_name = {}[m
+[31m-    if isinstance(bestiary, dict):[m
+[31m-        # soporta bestiary dict o list[m
+[31m-        if "monsters" in bestiary and isinstance(bestiary["monsters"], list):[m
+[31m-            src = bestiary["monsters"][m
+[31m-        elif isinstance(bestiary.get("data"), list):[m
+[31m-            src = bestiary["data"][m
+[31m-        else:[m
+[31m-            src = None[m
+[31m-        if src:[m
+[31m-            for m in src:[m
+[31m-                n = str(m.get("name", "")).strip()[m
+[31m-                if n:[m
+[31m-                    by_name[n.lower()] = m[m
+[31m-[m
+     def _as_int(v, default):[m
+         try:[m
+             if v is None:[m
+[36m@@ -1920,13 +2138,10 @@[m [mdef tool_spawn_encounter(encounter_json: str) -> str:[m
+             return default[m
+ [m
+     def _hp_for(cr: float, role: str) -> int:[m
+[31m-        # tabla “ligera” (no perfecta) pero estable[m
+[31m-        # base por CR aproximado[m
+         base = {[m
+             0: 5, 0.125: 9, 0.25: 13, 0.5: 22, 1: 33, 2: 52, 3: 72, 4: 88, 5: 110,[m
+             6: 130, 7: 150, 8: 175, 9: 200, 10: 225[m
+         }[m
+[31m-        # nearest key[m
+         keys = sorted(base.keys())[m
+         nearest = min(keys, key=lambda k: abs(k - cr))[m
+         hp = base[nearest][m
+[36m@@ -1937,83 +2152,67 @@[m [mdef tool_spawn_encounter(encounter_json: str) -> str:[m
+             hp = int(hp * 1.35)[m
+         elif role in {"boss"}:[m
+             hp = int(hp * 1.8)[m
+[31m-        return hp[m
+[32m+[m[32m        return int(max(1, hp))[m
+ [m
+     def _ac_for(cr: float, role: str) -> int:[m
+[31m-        # ligera: sube con CR[m
+         ac = 11 + int(cr // 2)[m
+         role = (role or "").lower()[m
+         if role in {"skirmisher"}:[m
+             ac += 1[m
+         if role in {"boss"}:[m
+             ac += 1[m
+[31m-        return min(20, max(10, ac))[m
+[32m+[m[32m        return int(min(20, max(10, ac)))[m
+ [m
+     def _atk_bonus_for(cr: float) -> int:[m
+[31m-        # aprox: CR 0-1 => +3, CR 2-4 => +5, etc.[m
+[31m-        return 3 + int(max(0, cr - 1) // 2) * 2[m
+[32m+[m[32m        return int(3 + int(max(0, cr - 1) // 2) * 2)[m
+ [m
+     def _save_dc_for(cr: float) -> int:[m
+[31m-        # aprox: CR 0-1 => 11-12, CR 3 => 13, CR 5 => 14, etc.[m
+[31m-        return 11 + int(max(0, cr) // 2)[m
+[31m-[m
+[31m-    def _import_from_bestiary(mon: dict, name_override: str) -> dict:[m
+[31m-        # Intenta mapear campos comunes (depende de tu bestiary)[m
+[31m-        ac = mon.get("ac", 10)[m
+[31m-        hp = mon.get("hp", 30)[m
+[31m-        # si hp viene como dict/string, fallback[m
+[31m-        if isinstance(hp, dict):[m
+[31m-            hp = hp.get("average", 30)[m
+[31m-        if isinstance(ac, list) and ac:[m
+[31m-            ac = ac[0].get("ac", 10) if isinstance(ac[0], dict) else ac[0][m
+[31m-        return {[m
+[31m-            "name": name_override,[m
+[31m-            "stub": False,[m
+[31m-            "ac": _as_int(ac, 10),[m
+[31m-            "hp": _as_int(hp, 30),[m
+[31m-            "hp_max": _as_int(hp, 30),[m
+[31m-            "conditions": [],[m
+[31m-            "source": "bestiary",[m
+[31m-            "raw": mon,  # opcional: guardar statblock entero para herramientas futuras[m
+[31m-        }[m
+[32m+[m[32m        return int(11 + int(max(0, cr) // 2))[m
+[32m+[m
+[32m+[m[32m    created, updated, ignored = [], [], [][m
+ [m
+[31m-    created = [][m
+[31m-    updated = [][m
+     for it in items:[m
+[31m-        if not isinstance(it, dict):[m
+[32m+[m[32m        if isinstance(it, str):[m
+[32m+[m[32m            name = it.strip()[m
+[32m+[m[32m            payload = {}[m
+[32m+[m[32m        elif isinstance(it, dict):[m
+[32m+[m[32m            name = str(it.get("name", "")).strip()[m
+[32m+[m[32m            payload = it[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            ignored.append(str(it))[m
+             continue[m
+ [m
+[31m-        name = str(it.get("name", "")).strip()[m
+         if not name:[m
+[32m+[m[32m            ignored.append(str(it))[m
+             continue[m
+ [m
+         # no crear si es party[m
+         if _find_party_member(canon, name):[m
+[32m+[m[32m            ignored.append(f"{name} (es party)")[m
+             continue[m
+ [m
+[31m-        # 1) Bestiary match[m
+[31m-        mon = by_name.get(name.lower())[m
+[32m+[m[32m        template = str(payload.get("template", "") or "").strip()[m
+[32m+[m[32m        role = str(payload.get("role", "") or "").strip().lower() or "skirmisher"[m
+ [m
+[31m-        # 2) Template match (por ejemplo "cultist")[m
+[31m-        template = str(it.get("template", "")).strip().lower()[m
+[31m-        if not mon and template:[m
+[31m-            mon = by_name.get(template.lower())[m
+[32m+[m[32m        # 1) bestiary match (template primero, luego name)[m
+[32m+[m[32m        mon_def = _get_monster_def_fuzzy(template) if template else None[m
+[32m+[m[32m        if not mon_def:[m
+[32m+[m[32m            mon_def = _get_monster_def_fuzzy(name)[m
+ [m
+[31m-        if mon:[m
+[31m-            entry = _import_from_bestiary(mon, name)[m
+[32m+[m[32m        if mon_def:[m
+[32m+[m[32m            entry = _import_monster_as_enemy(mon_def, name)[m
+         else:[m
+[31m-            # 3) Generate[m
+[31m-            role = str(it.get("role", "") or "").strip().lower() or "skirmisher"[m
+[31m-            cr = it.get("cr")[m
+[31m-            level = it.get("level")[m
+[32m+[m[32m            # 2) generate[m
+[32m+[m[32m            cr = payload.get("cr")[m
+[32m+[m[32m            level = payload.get("level")[m
+             try:[m
+                 cr_val = float(cr) if cr is not None else max(0.25, float(level or 1) / 2.0)[m
+             except Exception:[m
+                 cr_val = 0.25[m
+ [m
+[31m-            ac = _as_int(it.get("ac"), _ac_for(cr_val, role))[m
+[31m-            hp = _as_int(it.get("hp"), _hp_for(cr_val, role))[m
+[31m-            hp_max = _as_int(it.get("hp_max"), hp)[m
+[32m+[m[32m            ac = _as_int(payload.get("ac"), _ac_for(cr_val, role))[m
+[32m+[m[32m            max_hp = _as_int(payload.get("hp"), _hp_for(cr_val, role))[m
+[32m+[m[32m            max_hp = _as_int(payload.get("hp_max"), max_hp)[m
+ [m
+             entry = {[m
+                 "name": name,[m
+[36m@@ -2022,16 +2221,38 @@[m [mdef tool_spawn_encounter(encounter_json: str) -> str:[m
+                 "cr": cr_val,[m
+                 "level": level,[m
+                 "ac": ac,[m
+[31m-                "hp": hp,[m
+[31m-                "hp_max": hp_max,[m
+[32m+[m
+[32m+[m[32m                # runtime HP unificado[m
+[32m+[m[32m                "max_hp": int(max_hp),[m
+[32m+[m[32m                "hp_current": int(max_hp),[m
+[32m+[m
+[32m+[m[32m                # compat keys[m
+[32m+[m[32m                "hp": int(max_hp),[m
+[32m+[m[32m                "hp_max": int(max_hp),[m
+[32m+[m
+                 "conditions": [],[m
+                 "atk_bonus": _atk_bonus_for(cr_val),[m
+                 "save_dc": _save_dc_for(cr_val),[m
+[31m-                "spells": it.get("spells", []) or [],[m
+[31m-                "features": it.get("features", []) or [],[m
+[32m+[m[32m                "spells": payload.get("spells", []) or [],[m
+[32m+[m[32m                "features": payload.get("features", []) or [],[m
+                 "source": "generated",[m
+[32m+[m[32m                "speed": _speed_to_int(payload.get("speed", 30), default_speed=30),[m
+[32m+[m[32m                "move_left": 0,[m
+             }[m
+ [m
+[32m+[m[32m        # permitir overrides explícitos del payload (sin romper runtime hp)[m
+[32m+[m[32m        if isinstance(payload, dict):[m
+[32m+[m[32m            if "ac" in payload:[m
+[32m+[m[32m                entry["ac"] = _as_int(payload.get("ac"), entry.get("ac", 10))[m
+[32m+[m[32m            # si te pasan hp_current/max_hp explícitos[m
+[32m+[m[32m            if "max_hp" in payload or "hp_max" in payload or "hp" in payload or "hp_current" in payload:[m
+[32m+[m[32m                max_hp = _as_int(payload.get("max_hp"), _as_int(payload.get("hp_max"), _as_int(payload.get("hp"), entry.get("max_hp", 10))))[m
+[32m+[m[32m                hp_cur = _as_int(payload.get("hp_current"), max_hp)[m
+[32m+[m[32m                entry["max_hp"] = max(1, int(max_hp))[m
+[32m+[m[32m                entry["hp_current"] = max(0, int(hp_cur))[m
+[32m+[m[32m                entry["hp"] = entry["hp_current"][m
+[32m+[m[32m                entry["hp_max"] = entry["max_hp"][m
+[32m+[m
+         if name in enemies:[m
+             enemies[name].update(entry)[m
+             updated.append(name)[m
+[36m@@ -2040,7 +2261,13 @@[m [mdef tool_spawn_encounter(encounter_json: str) -> str:[m
+             created.append(name)[m
+ [m
+     canon_save(canon)[m
+[31m-    return f"SPAWN_ENCOUNTER OK\ncreated={created}\nupdated={updated}\ntotal_enemies={len(enemies)}"[m
+[32m+[m[32m    return ([m
+[32m+[m[32m        "SPAWN_ENCOUNTER OK\n"[m
+[32m+[m[32m        f"created={created}\n"[m
+[32m+[m[32m        f"updated={updated}\n"[m
+[32m+[m[32m        f"ignored={ignored}\n"[m
+[32m+[m[32m        f"total_enemies={len(enemies)}"[m
+[32m+[m[32m    )[m
+ [m
+ def tool_target_status(target: str) -> str:[m
+     canon = canon_load()[m
+[36m@@ -2181,9 +2408,28 @@[m [mdef tool_execute_actions(script: str, default_target: str = "") -> str:[m
+ [m
+     def _find_member(name: str) -> dict:[m
+         nn = _norm(name)[m
+[32m+[m[32m        # exact match[m
+         for m in members:[m
+             if _norm(m.get("name", "")) == nn:[m
+                 return m[m
+[32m+[m
+[32m+[m[32m        # fallback: match por primer token ("Kaelen" vs "Kaelen el Sombrío")[m
+[32m+[m[32m        nn_first = nn.split()[0] if nn.split() else nn[m
+[32m+[m[32m        for m in members:[m
+[32m+[m[32m            mm = _norm(m.get("name", ""))[m
+[32m+[m[32m            if mm.startswith(nn_first):[m
+[32m+[m[32m                return m[m
+[32m+[m
+[32m+[m[32m        # fuzzy match (typos tipo Kaedrel->Kaelen)[m
+[32m+[m[32m        names = [m.get("name", "") for m in members if m.get("name")][m
+[32m+[m[32m        lowered = {n.lower(): n for n in names}[m
+[32m+[m[32m        candidates = difflib.get_close_matches(nn, list(lowered.keys()), n=1, cutoff=0.72)[m
+[32m+[m[32m        if candidates:[m
+[32m+[m[32m            best = lowered[candidates[0]][m
+[32m+[m[32m            for m in members:[m
+[32m+[m[32m                if m.get("name") == best:[m
+[32m+[m[32m                    return m[m
+[32m+[m
+         return {}[m
+ [m
+     def _ability_mod(score) -> int:[m
+[36m@@ -2399,6 +2645,55 @@[m [mdef tool_execute_actions(script: str, default_target: str = "") -> str:[m
+     if not tgt:[m
+         return "No hay enemigos vivos registrados para ejecutar acciones."[m
+ [m
+[32m+[m[32m        # -------- PRE-FLIGHT: asegurar enemigos mencionados en el script --------[m
+[32m+[m[32m    def _extract_enemy_names(text: str) -> list[str]:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Detecta patrones tipo "Bandido A", "Cultista B", "Encapuchado Oscuro", etc.[m
+[32m+[m[32m        OJO: es heurístico; por eso filtramos contra party y enemigos ya registrados.[m
+[32m+[m[32m        """[m
+[32m+[m[32m        hits = set()[m
+[32m+[m
+[32m+[m[32m        # 1) cosas entre comillas "..."[m
+[32m+[m[32m        for q in re.findall(r'"([^"]+)"', text):[m
+[32m+[m[32m            q = q.strip()[m
+[32m+[m[32m            if len(q) >= 3:[m
+[32m+[m[32m                hits.add(q)[m
+[32m+[m
+[32m+[m[32m        # 2) patrón tipo "Bandido A" / "Cultista B"[m
+[32m+[m[32m        for m in re.findall(r'\b([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)\s+([A-Z])\b', text):[m
+[32m+[m[32m            hits.add(f"{m[0]} {m[1]}")[m
+[32m+[m
+[32m+[m[32m        # 3) patrón tipo "Encapuchado Oscuro" (dos palabras capitalizadas)[m
+[32m+[m[32m        for m in re.findall(r'\b([A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]+)\s+([A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]+)\b', text):[m
+[32m+[m[32m            cand = f"{m[0]} {m[1]}".strip()[m
+[32m+[m[32m            # filtra falsos positivos típicos[m
+[32m+[m[32m            if cand.lower() not in {"gran arma", "arma grande", "great weapon", "sharp shooter"}:[m
+[32m+[m[32m                hits.add(cand)[m
+[32m+[m
+[32m+[m[32m        return sorted(hits)[m
+[32m+[m
+[32m+[m[32m    mentioned = _extract_enemy_names(script)[m
+[32m+[m[32m    to_spawn = [n for n in mentioned if n not in enemies and not _find_member(n)][m
+[32m+[m[32m    if to_spawn:[m
+[32m+[m[32m        # En vez de stubs, intentamos spawn real (bestiary si hay match; si no, generado)[m
+[32m+[m[32m        spawn_items = [][m
+[32m+[m[32m        for n in to_spawn:[m
+[32m+[m[32m            # si hay bestiary match directo, spawn con name basta[m
+[32m+[m[32m            mon_def = _get_monster_def_fuzzy(n)[m
+[32m+[m[32m            if mon_def:[m
+[32m+[m[32m                spawn_items.append({"name": n})[m
+[32m+[m[32m            else:[m
+[32m+[m[32m                # fallback: generado “ligero”[m
+[32m+[m[32m                spawn_items.append({"name": n, "role": "skirmisher", "cr": 0.25})[m
+[32m+[m
+[32m+[m[32m        tool_spawn_encounter(json.dumps({"enemies": spawn_items}, ensure_ascii=False))[m
+[32m+[m
+[32m+[m[32m        # recarga canon/enemies para que ya existan en esta ejecución[m
+[32m+[m[32m        canon = canon_load()[m
+[32m+[m[32m        enemies = canon.get("enemies", {}) or {}[m
+[32m+[m[32m    # -----------------------------------------------------------------------[m
+[32m+[m
+[32m+[m
+     parts = [p.strip() for p in re.split(r"[.\n]+", script) if p.strip()][m
+     out_lines = ["EXECUTE_ACTIONS"][m
+ [m
+[1mdiff --git a/agent.py b/agent.py[m
+[1mindex 3766ccf..5621776 100644[m
+[1m--- a/agent.py[m
+[1m+++ b/agent.py[m
+[36m@@ -3,6 +3,7 @@[m [mimport time[m
+ import json[m
+ import re[m
+ import random[m
+[32m+[m[32mimport difflib[m
+ from dataclasses import dataclass, field[m
+ from typing import Any, Dict, List, Optional, Tuple, Callable, Set[m
+ import inspect[m
+[36m@@ -650,6 +651,9 @@[m [mdef _ensure_enemy_stub_anywhere(canon: dict, name: str, defaults: dict | None =[m
+     """[m
+     Garantiza que exista canon['enemies'][name]. Útil cuando el LLM narra enemigos[m
+     sin registrarlos previamente. Devuelve True si existe o se creó.[m
+[32m+[m
+[32m+[m[32m    IMPORTANTE: los stubs ya NO usan HP=999 (eso rompe la consistencia). Usamos valores[m
+[32m+[m[32m    modestos y marcamos stub=True para que luego pueda “enriquecerse” vía bestiary/spawn.[m
+     """[m
+     name = (name or "").strip()[m
+     if not name:[m
+[36m@@ -662,22 +666,61 @@[m [mdef _ensure_enemy_stub_anywhere(canon: dict, name: str, defaults: dict | None =[m
+     canon.setdefault("enemies", {})[m
+     enemies = canon["enemies"][m
+ [m
+[32m+[m[32m    def _hp_defaults() -> tuple[int, int]:[m
+[32m+[m[32m        # Defaults razonables para un “desconocido”[m
+[32m+[m[32m        return (10, 10)  # (hp_current, max_hp)[m
+[32m+[m
+     if name in enemies:[m
+[31m-        # asegurar campos mínimos[m
+[31m-        enemies[name].setdefault("name", name)[m
+[31m-        enemies[name].setdefault("conditions", [])[m
+[31m-        enemies[name].setdefault("ac", 10)[m
+[31m-        enemies[name].setdefault("hp", 999)[m
+[31m-        enemies[name].setdefault("hp_max", enemies[name].get("hp", 999))[m
+[32m+[m[32m        e = enemies[name][m
+[32m+[m[32m        e.setdefault("name", name)[m
+[32m+[m[32m        e.setdefault("conditions", [])[m
+[32m+[m[32m        e.setdefault("ac", 10)[m
+[32m+[m
+[32m+[m[32m        # Unificar runtime HP[m
+[32m+[m[32m        hp_cur = e.get("hp_current", e.get("hp", None))[m
+[32m+[m[32m        hp_max = e.get("max_hp", e.get("hp_max", None))[m
+[32m+[m[32m        if hp_cur is None or hp_max is None:[m
+[32m+[m[32m            dcur, dmax = _hp_defaults()[m
+[32m+[m[32m            hp_cur = dcur if hp_cur is None else hp_cur[m
+[32m+[m[32m            hp_max = dmax if hp_max is None else hp_max[m
+[32m+[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            hp_cur_i = int(hp_cur)[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            hp_cur_i = _hp_defaults()[0][m
+[32m+[m[32m        try:[m
+[32m+[m[32m            hp_max_i = int(hp_max)[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            hp_max_i = max(hp_cur_i, _hp_defaults()[1])[m
+[32m+[m
+[32m+[m[32m        e["hp_current"] = max(0, hp_cur_i)[m
+[32m+[m[32m        e["max_hp"] = max(1, hp_max_i)[m
+[32m+[m
+[32m+[m[32m        # Mantener compatibilidad con claves antiguas[m
+[32m+[m[32m        e["hp"] = e["hp_current"][m
+[32m+[m[32m        e["hp_max"] = e["max_hp"][m
+[32m+[m
+[32m+[m[32m        # Si no estaba marcado, que siga indicando stub si no tiene source[m
+[32m+[m[32m        e.setdefault("stub", True)[m
+[32m+[m
+[32m+[m[32m        # aplicar defaults extra si vienen[m
+[32m+[m[32m        if defaults and isinstance(defaults, dict):[m
+[32m+[m[32m            for k, v in defaults.items():[m
+[32m+[m[32m                if v is not None:[m
+[32m+[m[32m                    e[k] = v[m
+[32m+[m
+         canon_save(canon)[m
+         return True[m
+ [m
+[32m+[m[32m    dcur, dmax = _hp_defaults()[m
+     stub = {[m
+         "name": name,[m
+         "stub": True,[m
+         "ac": 10,[m
+[31m-        "hp": 999,[m
+[31m-        "hp_max": 999,[m
+[32m+[m[32m        "hp_current": dcur,[m
+[32m+[m[32m        "max_hp": dmax,[m
+[32m+[m[32m        "hp": dcur,       # compat[m
+[32m+[m[32m        "hp_max": dmax,   # compat[m
+         "conditions": [],[m
+     }[m
+     if defaults and isinstance(defaults, dict):[m
+[36m@@ -691,6 +734,8 @@[m [mdef _ensure_enemy_stub_from_combat(canon: dict, target: str) -> bool:[m
+     """[m
+     Si hay combate activo y el target está en la iniciativa con side != party,[m
+     crea un enemigo stub en canon['enemies'] para permitir ataques/condiciones.[m
+[32m+[m
+[32m+[m[32m    IMPORTANTE: los stubs ya NO usan HP=999 (eso rompe la consistencia).[m
+     """[m
+     combat = canon.get("combat", {}) or {}[m
+     if not combat.get("active"):[m
+[36m@@ -713,13 +758,14 @@[m [mdef _ensure_enemy_stub_from_combat(canon: dict, target: str) -> bool:[m
+             if name in enemies:[m
+                 return True[m
+ [m
+[31m-            # crear stub (valores por defecto + marca)[m
+             enemies[name] = {[m
+                 "name": name,[m
+                 "stub": True,[m
+                 "ac": 10,[m
+[31m-                "hp": 999,[m
+[31m-                "hp_max": 999,[m
+[32m+[m[32m                "hp_current": 10,[m
+[32m+[m[32m                "max_hp": 10,[m
+[32m+[m[32m                "hp": 10,        # compat[m
+[32m+[m[32m                "hp_max": 10,    # compat[m
+                 "conditions": [],[m
+             }[m
+             canon_save(canon)[m
+[36m@@ -909,6 +955,181 @@[m [mdef _get_monster_def_by_name(name: str) -> Optional[dict]:[m
+         return None[m
+     return (comp.get("monsters") or {}).get(monster_id)[m
+ [m
+[32m+[m[32m# =========================================================[m
+[32m+[m[32m# Bestiary helpers (compendio) — match flexible + normalización[m
+[32m+[m[32m# =========================================================[m
+[32m+[m
+[32m+[m[32m# Alias ES -> EN mínimo (ampliable). Solo se aplica al primer token.[m
+[32m+[m[32m_MONSTER_FIRSTWORD_ALIASES = {[m
+[32m+[m[32m    "cultista": "cultist",[m
+[32m+[m[32m    "bandido": "bandit",[m
+[32m+[m[32m    "guardia": "guard",[m
+[32m+[m[32m    "capitán": "captain",[m
+[32m+[m[32m    "capitan": "captain",[m
+[32m+[m[32m    "acólito": "acolyte",[m
+[32m+[m[32m    "acolito": "acolyte",[m
+[32m+[m[32m    "lobo": "wolf",[m
+[32m+[m[32m    "oso": "bear",[m
+[32m+[m[32m    "orco": "orc",[m
+[32m+[m[32m    "trol": "troll",[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mdef _monster_alias_candidates(name: str) -> list[str]:[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Genera candidatos de nombre para mejorar el match con bestiary (ES->EN básico).[m
+[32m+[m[32m    """[m
+[32m+[m[32m    name = (name or "").strip()[m
+[32m+[m[32m    if not name:[m
+[32m+[m[32m        return [][m
+[32m+[m[32m    parts = name.split()[m
+[32m+[m[32m    if not parts:[m
+[32m+[m[32m        return [name][m
+[32m+[m[32m    first = parts[0].lower()[m
+[32m+[m[32m    if first in _MONSTER_FIRSTWORD_ALIASES:[m
+[32m+[m[32m        parts2 = [_MONSTER_FIRSTWORD_ALIASES[first]] + parts[1:][m
+[32m+[m[32m        return [name, " ".join(parts2)][m
+[32m+[m[32m    return [name][m
+[32m+[m
+[32m+[m[32mdef _strip_instance_suffix(name: str) -> str:[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Quita sufijos típicos de “instancia”: 'A', '#2', '2', etc.[m
+[32m+[m[32m    Ej: 'Cultist A' -> 'Cultist', 'Goblin #2' -> 'Goblin'[m
+[32m+[m[32m    """[m
+[32m+[m[32m    s = (name or "").strip()[m
+[32m+[m[32m    if not s:[m
+[32m+[m[32m        return s[m
+[32m+[m[32m    # 'X #2' o 'X 2'[m
+[32m+[m[32m    s = re.sub(r"\s+#\d+\s*$", "", s)[m
+[32m+[m[32m    s = re.sub(r"\s+\d+\s*$", "", s)[m
+[32m+[m[32m    # 'X A' / 'X B'[m
+[32m+[m[32m    s = re.sub(r"\s+[A-Z]\s*$", "", s)[m
+[32m+[m[32m    return s.strip()[m
+[32m+[m
+[32m+[m[32mdef _get_monster_def_fuzzy(name: str) -> Optional[dict]:[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Busca un monstruo en el compendio por:[m
+[32m+[m[32m      - match exacto en indexes.by_name[m
+[32m+[m[32m      - match quitando sufijos (A/#2)[m
+[32m+[m[32m      - match por alias ES->EN básico[m
+[32m+[m[32m      - match difuso (difflib) sobre indexes.by_name[m
+[32m+[m[32m    """[m
+[32m+[m[32m    comp = get_bestiary()[m
+[32m+[m[32m    if not comp or not name:[m
+[32m+[m[32m        return None[m
+[32m+[m[32m    idx = (comp.get("indexes") or {}).get("by_name") or {}[m
+[32m+[m[32m    monsters = (comp.get("monsters") or {})[m
+[32m+[m
+[32m+[m[32m    # 1) exacto / por variantes[m
+[32m+[m[32m    candidates = [][m
+[32m+[m[32m    for base in _monster_alias_candidates(name):[m
+[32m+[m[32m        candidates.append(base)[m
+[32m+[m[32m        candidates.append(_strip_instance_suffix(base))[m
+[32m+[m
+[32m+[m[32m    for cand in candidates:[m
+[32m+[m[32m        mid = idx.get(_norm(cand))[m
+[32m+[m[32m        if mid and mid in monsters:[m
+[32m+[m[32m            return monsters[mid][m
+[32m+[m
+[32m+[m[32m    # 2) difuso[m
+[32m+[m[32m    keys = list(idx.keys())[m
+[32m+[m[32m    for cand in candidates:[m
+[32m+[m[32m        nn = _norm(cand)[m
+[32m+[m[32m        close = difflib.get_close_matches(nn, keys, n=1, cutoff=0.84)[m
+[32m+[m[32m        if close:[m
+[32m+[m[32m            mid = idx.get(close[0])[m
+[32m+[m[32m            if mid and mid in monsters:[m
+[32m+[m[32m                return monsters[mid][m
+[32m+[m
+[32m+[m[32m    return None[m
+[32m+[m
+[32m+[m[32mdef _import_monster_as_enemy(mon: dict, instance_name: str) -> dict:[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Convierte un statblock del bestiary a un enemigo “runtime” estable en canon['enemies'].[m
+[32m+[m[32m    Unifica HP en: max_hp + hp_current (+ compat: hp/hp_max).[m
+[32m+[m[32m    """[m
+[32m+[m[32m    # AC[m
+[32m+[m[32m    ac_raw = mon.get("ac", 10)[m
+[32m+[m[32m    ac = 10[m
+[32m+[m[32m    if isinstance(ac_raw, list) and ac_raw:[m
+[32m+[m[32m        first = ac_raw[0][m
+[32m+[m[32m        if isinstance(first, dict) and "ac" in first:[m
+[32m+[m[32m            ac = int(first.get("ac") or 10)[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            try:[m
+[32m+[m[32m                ac = int(first)[m
+[32m+[m[32m            except Exception:[m
+[32m+[m[32m                ac = 10[m
+[32m+[m[32m    else:[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            ac = int(ac_raw)[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            ac = 10[m
+[32m+[m
+[32m+[m[32m    # HP[m
+[32m+[m[32m    hp_raw = mon.get("hp", 10)[m
+[32m+[m[32m    max_hp = 10[m
+[32m+[m[32m    if isinstance(hp_raw, dict):[m
+[32m+[m[32m        # tu compendio usa 'avg'; soportamos 'average' también[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            max_hp = int(hp_raw.get("avg") or hp_raw.get("average") or 10)[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            max_hp = 10[m
+[32m+[m[32m    elif isinstance(hp_raw, str):[m
+[32m+[m[32m        # formatos tipo "45 (6d8+18)"[m
+[32m+[m[32m        m = re.match(r"^\s*(\d+)", hp_raw)[m
+[32m+[m[32m        if m:[m
+[32m+[m[32m            max_hp = int(m.group(1))[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            max_hp = 10[m
+[32m+[m[32m    else:[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            max_hp = int(hp_raw)[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            max_hp = 10[m
+[32m+[m
+[32m+[m[32m    max_hp = max(1, int(max_hp))[m
+[32m+[m
+[32m+[m[32m    entry = {[m
+[32m+[m[32m        "name": instance_name,[m
+[32m+[m[32m        "stub": False,[m
+[32m+[m[32m        "source": "bestiary",[m
+[32m+[m[32m        "_bestiary_name": str(mon.get("name") or instance_name),[m
+[32m+[m[32m        "ac": ac,[m
+[32m+[m
+[32m+[m[32m        # runtime HP unificado[m
+[32m+[m[32m        "max_hp": max_hp,[m
+[32m+[m[32m        "hp_current": max_hp,[m
+[32m+[m
+[32m+[m[32m        # compat keys (hay funciones que aún leen estas)[m
+[32m+[m[32m        "hp": max_hp,[m
+[32m+[m[32m        "hp_max": max_hp,[m
+[32m+[m
+[32m+[m[32m        "conditions": [],[m
+[32m+[m[32m        "speed": _speed_to_int(mon.get("speed", 30), default_speed=30),[m
+[32m+[m[32m        "move_left": 0,[m
+[32m+[m
+[32m+[m[32m        # guardar referencia mínima para auditoría / futuros tools[m
+[32m+[m[32m        "raw": mon,[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    # CR si existe[m
+[32m+[m[32m    if "cr" in mon:[m
+[32m+[m[32m        cr_val = _parse_cr(mon.get("cr"))[m
+[32m+[m[32m        if cr_val is not None:[m
+[32m+[m[32m            entry["cr"] = cr_val[m
+[32m+[m
+[32m+[m[32m    # Abilities si existen como keys[m
+[32m+[m[32m    abil = {}[m
+[32m+[m[32m    for k in ["str", "dex", "con", "int", "wis", "cha"]:[m
+[32m+[m[32m        if k in mon:[m
+[32m+[m[32m            try:[m
+[32m+[m[32m                abil[k] = int(mon.get(k))[m
+[32m+[m[32m            except Exception:[m
+[32m+[m[32m                pass[m
+[32m+[m[32m    if abil:[m
+[32m+[m[32m        entry["abilities"] = abil[m
+[32m+[m
+[32m+[m[32m    return entry[m
+ [m
+ def _has_condition(obj: dict, name: str) -> bool:[m
+     name = (name or "").upper()[m
+[36m@@ -1641,22 +1862,12 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+     Registra enemigos en canon['enemies'] sin necesidad de iniciar combate.[m
+ [m
+     Entrada (JSON string) aceptada:[m
+[31m-    - ["Cultista A", "Cultista B"][m
+[31m-    - [{"name":"Cultista A","ac":12,"hp":27}, {"name":"Encapuchado Oscuro","ac":14}][m
+[32m+[m[32m    - ["Cultist A", "Cultist B"][m
+[32m+[m[32m    - [{"name":"Cultist A","ac":12,"hp":27}, {"name":"Encapuchado Oscuro","ac":14}][m
+     - {"enemies":[...]}  (lista como arriba)[m
+ [m
+[31m-    Además, si vienen estos campos, también los guarda:[m
+[31m-    - role, level, cr[m
+[31m-    - abilities: {str,dex,con,int,wis,cha}[m
+[31m-    - skills: {"Stealth":5,"Perception":3} o lista[m
+[31m-    - saves: {"DEX":4,"WIS":2} o lista[m
+[31m-    - attacks: lista de ataques (texto libre o dicts)[m
+[31m-    - spells: lista de conjuros (strings)[m
+[31m-    - features: lista de rasgos (strings)[m
+[31m-    - tags: lista de etiquetas[m
+[31m-    - notes: texto libre[m
+[31m-    - source: "generated"/"bestiary"/...[m
+[31m-    - stub: bool[m
+[32m+[m[32m    NUEVO:[m
+[32m+[m[32m    - Si el nombre (o template) coincide con bestiary, importa AC/HP y marca stub=False por defecto.[m
+ [m
+     Devuelve un resumen de creados/actualizados/ignorados.[m
+     """[m
+[36m@@ -1707,7 +1918,6 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+         if isinstance(v, str):[m
+             s = v.strip()[m
+             return [s] if s else [][m
+[31m-        # dict u otros -> encapsular[m
+         return [v][m
+ [m
+     def _as_dict(v):[m
+[36m@@ -1733,11 +1943,34 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+             ignored.append(f"{name} (es party)")[m
+             continue[m
+ [m
+[31m-        # Defaults mínimos[m
+[31m-        ac = _as_int(payload.get("ac"), 10)[m
+[31m-        hp = _as_int(payload.get("hp"), 999)[m
+[31m-        hp_max = _as_int(payload.get("hp_max"), hp)[m
+[31m-        stub = bool(payload.get("stub", True))[m
+[32m+[m[32m        template = str(payload.get("template", "") or "").strip()[m
+[32m+[m
+[32m+[m[32m        # Defaults (si hay bestiary, mejor)[m
+[32m+[m[32m        mon_def = _get_monster_def_fuzzy(template) if template else None[m
+[32m+[m[32m        if not mon_def:[m
+[32m+[m[32m            mon_def = _get_monster_def_fuzzy(name)[m
+[32m+[m
+[32m+[m[32m        if mon_def:[m
+[32m+[m[32m            base_entry = _import_monster_as_enemy(mon_def, name)[m
+[32m+[m[32m            default_ac = int(base_entry.get("ac", 10))[m
+[32m+[m[32m            default_max_hp = int(base_entry.get("max_hp", 10))[m
+[32m+[m[32m            default_stub = False[m
+[32m+[m[32m            default_source = "bestiary"[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            default_ac = 10[m
+[32m+[m[32m            default_max_hp = 10[m
+[32m+[m[32m            default_stub = True[m
+[32m+[m[32m            default_source = "generated"[m
+[32m+[m
+[32m+[m[32m        # Aplicar overrides del payload si vienen[m
+[32m+[m[32m        ac = _as_int(payload.get("ac"), default_ac)[m
+[32m+[m[32m        max_hp = _as_int(payload.get("hp"), default_max_hp)[m
+[32m+[m[32m        max_hp = _as_int(payload.get("hp_max"), max_hp)[m
+[32m+[m[32m        max_hp = _as_int(payload.get("max_hp"), max_hp)[m
+[32m+[m[32m        hp_current = _as_int(payload.get("hp_current"), max_hp)[m
+[32m+[m
+[32m+[m[32m        stub = bool(payload.get("stub", default_stub))[m
+[32m+[m[32m        source_s = str(payload.get("source", default_source)).strip() if payload.get("source", default_source) is not None else default_source[m
+ [m
+         # Campos “ricos” opcionales[m
+         role = payload.get("role")[m
+[36m@@ -1751,7 +1984,6 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+         features = payload.get("features")[m
+         tags = payload.get("tags")[m
+         notes = payload.get("notes")[m
+[31m-        source = payload.get("source")[m
+ [m
+         # Normalizar tipos[m
+         level_i = _as_int(level, None) if level is not None else None[m
+[36m@@ -1764,44 +1996,51 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+         features_l = _as_list(features) if features is not None else None[m
+         tags_l = _as_list(tags) if tags is not None else None[m
+         notes_s = str(notes).strip() if notes is not None else None[m
+[31m-        source_s = str(source).strip() if source is not None else None[m
+         role_s = str(role).strip() if role is not None else None[m
+ [m
+         if name not in enemies:[m
+[31m-            enemies[name] = {[m
+[32m+[m[32m            # base from bestiary if exists (pero dejamos que payload sobrescriba abajo)[m
+[32m+[m[32m            entry = {}[m
+[32m+[m[32m            if mon_def:[m
+[32m+[m[32m                entry.update(_import_monster_as_enemy(mon_def, name))[m
+[32m+[m
+[32m+[m[32m            entry.update({[m
+                 "name": name,[m
+                 "stub": stub,[m
+                 "ac": ac,[m
+[31m-                "hp": hp,[m
+[31m-                "hp_max": hp_max,[m
+[32m+[m[32m                "max_hp": max(1, int(max_hp)),[m
+[32m+[m[32m                "hp_current": max(0, int(hp_current)),[m
+[32m+[m[32m                "hp": max(0, int(hp_current)),          # compat[m
+[32m+[m[32m                "hp_max": max(1, int(max_hp)),          # compat[m
+                 "conditions": [],[m
+[31m-            }[m
+[32m+[m[32m                "source": source_s,[m
+[32m+[m[32m            })[m
+[32m+[m
+             # Añadir “ricos” si vienen[m
+             if role_s is not None:[m
+[31m-                enemies[name]["role"] = role_s[m
+[32m+[m[32m                entry["role"] = role_s[m
+             if level_i is not None:[m
+[31m-                enemies[name]["level"] = level_i[m
+[32m+[m[32m                entry["level"] = level_i[m
+             if cr_f is not None:[m
+[31m-                enemies[name]["cr"] = cr_f[m
+[32m+[m[32m                entry["cr"] = cr_f[m
+             if abilities_d:[m
+[31m-                enemies[name]["abilities"] = abilities_d[m
+[32m+[m[32m                entry["abilities"] = abilities_d[m
+             if skills_d is not None:[m
+[31m-                enemies[name]["skills"] = skills_d[m
+[32m+[m[32m                entry["skills"] = skills_d[m
+             if saves_d is not None:[m
+[31m-                enemies[name]["saves"] = saves_d[m
+[32m+[m[32m                entry["saves"] = saves_d[m
+             if attacks_l is not None:[m
+[31m-                enemies[name]["attacks"] = attacks_l[m
+[32m+[m[32m                entry["attacks"] = attacks_l[m
+             if spells_l is not None:[m
+[31m-                enemies[name]["spells"] = spells_l[m
+[32m+[m[32m                entry["spells"] = spells_l[m
+             if features_l is not None:[m
+[31m-                enemies[name]["features"] = features_l[m
+[32m+[m[32m                entry["features"] = features_l[m
+             if tags_l is not None:[m
+[31m-                enemies[name]["tags"] = tags_l[m
+[32m+[m[32m                entry["tags"] = tags_l[m
+             if notes_s is not None:[m
+[31m-                enemies[name]["notes"] = notes_s[m
+[31m-            if source_s is not None:[m
+[31m-                enemies[name]["source"] = source_s[m
+[32m+[m[32m                entry["notes"] = notes_s[m
+ [m
+[32m+[m[32m            enemies[name] = entry[m
+             created.append(name)[m
+ [m
+         else:[m
+[36m@@ -1809,15 +2048,23 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+             eobj.setdefault("name", name)[m
+             eobj.setdefault("conditions", [])[m
+ [m
+[31m-            # sobrescribir solo si viene en payload[m
+[32m+[m[32m            # sobrescribir solo si viene en payload (o si es stub y hay bestiary)[m
+[32m+[m[32m            if mon_def and eobj.get("stub") and not payload.get("stub", None):[m
+[32m+[m[32m                # “enriquece” un stub con bestiary si no te lo han bloqueado explícitamente[m
+[32m+[m[32m                eobj.update(_import_monster_as_enemy(mon_def, name))[m
+[32m+[m
+             if "ac" in payload:[m
+                 eobj["ac"] = ac[m
+[31m-            if "hp" in payload:[m
+[31m-                eobj["hp"] = hp[m
+[31m-            if "hp_max" in payload:[m
+[31m-                eobj["hp_max"] = hp_max[m
+[32m+[m[32m            if any(k in payload for k in ["hp", "hp_max", "max_hp", "hp_current"]):[m
+[32m+[m[32m                eobj["max_hp"] = max(1, int(max_hp))[m
+[32m+[m[32m                eobj["hp_current"] = max(0, int(hp_current))[m
+[32m+[m[32m                eobj["hp"] = eobj["hp_current"][m
+[32m+[m[32m                eobj["hp_max"] = eobj["max_hp"][m
+[32m+[m
+             if "stub" in payload:[m
+                 eobj["stub"] = stub[m
+[32m+[m[32m            if "source" in payload:[m
+[32m+[m[32m                eobj["source"] = source_s[m
+ [m
+             if role_s is not None and "role" in payload:[m
+                 eobj["role"] = role_s[m
+[36m@@ -1841,8 +2088,6 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+                 eobj["tags"] = tags_l[m
+             if notes is not None and "notes" in payload:[m
+                 eobj["notes"] = notes_s[m
+[31m-            if source is not None and "source" in payload:[m
+[31m-                eobj["source"] = source_s[m
+ [m
+             updated.append(name)[m
+ [m
+[36m@@ -1859,21 +2104,20 @@[m [mdef tool_register_enemies(names_json: str) -> str:[m
+ def tool_spawn_encounter(encounter_json: str) -> str:[m
+     """[m
+     Crea enemigos con stats jugables.[m
+[31m-    - Si encuentra coincidencia en bestiary.json (por name o by_key), importa stats.[m
+[32m+[m[32m    - Si encuentra coincidencia en bestiary.json (compendio: indexes.by_name + monsters{}), importa stats.[m
+     - Si no, genera stats por role + cr/level.[m
+ [m
+     Entrada JSON (string):[m
+     {[m
+       "enemies": [[m
+[31m-        {"name":"Cultista A","template":"cultist","cr":0.25},[m
+[31m-        {"name":"Cultista B","template":"cultist","cr":0.25},[m
+[31m-        {"name":"Cultista C","template":"cultist","cr":0.25},[m
+[32m+[m[32m        {"name":"Cultist A","template":"cultist","cr":0.25},[m
+[32m+[m[32m        {"name":"Cultist B","template":"cultist","cr":0.25},[m
+         {"name":"Encapuchado Oscuro","role":"caster","cr":3, "spells":["Hold Person","Magic Missile"]}[m
+       ][m
+     }[m
+     """[m
+     try:[m
+[31m-        data = json.loads(encounter_json)[m
+[32m+[m[32m        data = json.loads(encounter_json) if isinstance(encounter_json, str) else encounter_json[m
+     except Exception as e:[m
+         return f"Error: encounter_json no es JSON válido: {e}"[m
+ [m
+[36m@@ -1885,32 +2129,6 @@[m [mdef tool_spawn_encounter(encounter_json: str) -> str:[m
+     canon.setdefault("enemies", {})[m
+     enemies = canon["enemies"][m
+ [m
+[31m-    # --- cargar bestiary.json una vez ---[m
+[31m-    ROOT = Path(__file__).resolve().parent[m
+[31m-    bestiary_path = ROOT / "dm" / "bestiary.json"[m
+[31m-    bestiary = {}[m
+[31m-    if bestiary_path.exists():[m
+[31m-        try:[m
+[31m-            bestiary = json.loads(bestiary_path.read_text(encoding="utf-8"))[m
+[31m-        except Exception:[m
+[31m-            bestiary = {}[m
+[31m-[m
+[31m-    # Índice simple por nombre (case-insensitive)[m
+[31m-    by_name = {}[m
+[31m-    if isinstance(bestiary, dict):[m
+[31m-        # soporta bestiary dict o list[m
+[31m-        if "monsters" in bestiary and isinstance(bestiary["monsters"], list):[m
+[31m-            src = bestiary["monsters"][m
+[31m-        elif isinstance(bestiary.get("data"), list):[m
+[31m-            src = bestiary["data"][m
+[31m-        else:[m
+[31m-            src = None[m
+[31m-        if src:[m
+[31m-            for m in src:[m
+[31m-                n = str(m.get("name", "")).strip()[m
+[31m-                if n:[m
+[31m-                    by_name[n.lower()] = m[m
+[31m-[m
+     def _as_int(v, default):[m
+         try:[m
+             if v is None:[m
+[36m@@ -1920,13 +2138,10 @@[m [mdef tool_spawn_encounter(encounter_json: str) -> str:[m
+             return default[m
+ [m
+     def _hp_for(cr: float, role: str) -> int:[m
+[31m-        # tabla “ligera” (no perfecta) pero estable[m
+[31m-        # base por CR aproximado[m
+         base = {[m
+             0: 5, 0.125: 9, 0.25: 13, 0.5: 22, 1: 33, 2: 52, 3: 72, 4: 88, 5: 110,[m
+             6: 130, 7: 150, 8: 175, 9: 200, 10: 225[m
+         }[m
+[31m-        # nearest key[m
+         keys = sorted(base.keys())[m
+         nearest = min(keys, key=lambda k: abs(k - cr))[m
+         hp = base[nearest][m
+[36m@@ -1937,83 +2152,67 @@[m [mdef tool_spawn_encounter(encounter_json: str) -> str:[m
+             hp = int(hp * 1.35)[m
+         elif role in {"boss"}:[m
+             hp = int(hp * 1.8)[m
+[31m-        return hp[m
+[32m+[m[32m        return int(max(1, hp))[m
+ [m
+     def _ac_for(cr: float, role: str) -> int:[m
+[31m-        # ligera: sube con CR[m
+         ac = 11 + int(cr // 2)[m
+         role = (role or "").lower()[m
+         if role in {"skirmisher"}:[m
+             ac += 1[m
+         if role in {"boss"}:[m
+             ac += 1[m
+[31m-        return min(20, max(10, ac))[m
+[32m+[m[32m        return int(min(20, max(10, ac)))[m
+ [m
+     def _atk_bonus_for(cr: float) -> int:[m
+[31m-        # aprox: CR 0-1 => +3, CR 2-4 => +5, etc.[m
+[31m-        return 3 + int(max(0, cr - 1) // 2) * 2[m
+[32m+[m[32m        return int(3 + int(max(0, cr - 1) // 2) * 2)[m
+ [m
+     def _save_dc_for(cr: float) -> int:[m
+[31m-        # aprox: CR 0-1 => 11-12, CR 3 => 13, CR 5 => 14, etc.[m
+[31m-        return 11 + int(max(0, cr) // 2)[m
+[31m-[m
+[31m-    def _import_from_bestiary(mon: dict, name_override: str) -> dict:[m
+[31m-        # Intenta mapear campos comunes (depende de tu bestiary)[m
+[31m-        ac = mon.get("ac", 10)[m
+[31m-        hp = mon.get("hp", 30)[m
+[31m-        # si hp viene como dict/string, fallback[m
+[31m-        if isinstance(hp, dict):[m
+[31m-            hp = hp.get("average", 30)[m
+[31m-        if isinstance(ac, list) and ac:[m
+[31m-            ac = ac[0].get("ac", 10) if isinstance(ac[0], dict) else ac[0][m
+[31m-        return {[m
+[31m-            "name": name_override,[m
+[31m-            "stub": False,[m
+[31m-            "ac": _as_int(ac, 10),[m
+[31m-            "hp": _as_int(hp, 30),[m
+[31m-            "hp_max": _as_int(hp, 30),[m
+[31m-            "conditions": [],[m
+[31m-            "source": "bestiary",[m
+[31m-            "raw": mon,  # opcional: guardar statblock entero para herramientas futuras[m
+[31m-        }[m
+[32m+[m[32m        return int(11 + int(max(0, cr) // 2))[m
+[32m+[m
+[32m+[m[32m    created, updated, ignored = [], [], [][m
+ [m
+[31m-    created = [][m
+[31m-    updated = [][m
+     for it in items:[m
+[31m-        if not isinstance(it, dict):[m
+[32m+[m[32m        if isinstance(it, str):[m
+[32m+[m[32m            name = it.strip()[m
+[32m+[m[32m            payload = {}[m
+[32m+[m[32m        elif isinstance(it, dict):[m
+[32m+[m[32m            name = str(it.get("name", "")).strip()[m
+[32m+[m[32m            payload = it[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            ignored.append(str(it))[m
+             continue[m
+ [m
+[31m-        name = str(it.get("name", "")).strip()[m
+         if not name:[m
+[32m+[m[32m            ignored.append(str(it))[m
+             continue[m
+ [m
+         # no crear si es party[m
+         if _find_party_member(canon, name):[m
+[32m+[m[32m            ignored.append(f"{name} (es party)")[m
+             continue[m
+ [m
+[31m-        # 1) Bestiary match[m
+[31m-        mon = by_name.get(name.lower())[m
+[32m+[m[32m        template = str(payload.get("template", "") or "").strip()[m
+[32m+[m[32m        role = str(payload.get("role", "") or "").strip().lower() or "skirmisher"[m
+ [m
+[31m-        # 2) Template match (por ejemplo "cultist")[m
+[31m-        template = str(it.get("template", "")).strip().lower()[m
+[31m-        if not mon and template:[m
+[31m-            mon = by_name.get(template.lower())[m
+[32m+[m[32m        # 1) bestiary match (template primero, luego name)[m
+[32m+[m[32m        mon_def = _get_monster_def_fuzzy(template) if template else None[m
+[32m+[m[32m        if not mon_def:[m
+[32m+[m[32m            mon_def = _get_monster_def_fuzzy(name)[m
+ [m
+[31m-        if mon:[m
+[31m-            entry = _import_from_bestiary(mon, name)[m
+[32m+[m[32m        if mon_def:[m
+[32m+[m[32m            entry = _import_monster_as_enemy(mon_def, name)[m
+         else:[m
+[31m-            # 3) Generate[m
+[31m-            role = str(it.get("role", "") or "").strip().lower() or "skirmisher"[m
+[31m-            cr = it.get("cr")[m
+[31m-            level = it.get("level")[m
+[32m+[m[32m            # 2) generate[m
+[32m+[m[32m            cr = payload.get("cr")[m
+[32m+[m[32m            level = payload.get("level")[m
+             try:[m
+                 cr_val = float(cr) if cr is not None else max(0.25, float(level or 1) / 2.0)[m
+             except Exception:[m
+                 cr_val = 0.25[m
+ [m
+[31m-            ac = _as_int(it.get("ac"), _ac_for(cr_val, role))[m
+[31m-            hp = _as_int(it.get("hp"), _hp_for(cr_val, role))[m
+[31m-            hp_max = _as_int(it.get("hp_max"), hp)[m
+[32m+[m[32m            ac = _as_int(payload.get("ac"), _ac_for(cr_val, role))[m
+[32m+[m[32m            max_hp = _as_int(payload.get("hp"), _hp_for(cr_val, role))[m
+[32m+[m[32m            max_hp = _as_int(payload.get("hp_max"), max_hp)[m
+ [m
+             entry = {[m
+                 "name": name,[m
+[36m@@ -2022,16 +2221,38 @@[m [mdef tool_spawn_encounter(encounter_json: str) -> str:[m
+                 "cr": cr_val,[m
+                 "level": level,[m
+                 "ac": ac,[m
+[31m-                "hp": hp,[m
+[31m-                "hp_max": hp_max,[m
+[32m+[m
+[32m+[m[32m                # runtime HP unificado[m
+[32m+[m[32m                "max_hp": int(max_hp),[m
+[32m+[m[32m                "hp_current": int(max_hp),[m
+[32m+[m
+[32m+[m[32m                # compat keys[m
+[32m+[m[32m                "hp": int(max_hp),[m
+[32m+[m[32m                "hp_max": int(max_hp),[m
+[32m+[m
+                 "conditions": [],[m
+                 "atk_bonus": _atk_bonus_for(cr_val),[m
+                 "save_dc": _save_dc_for(cr_val),[m
+[31m-                "spells": it.get("spells", []) or [],[m
+[31m-                "features": it.get("features", []) or [],[m
+[32m+[m[32m                "spells": payload.get("spells", []) or [],[m
+[32m+[m[32m                "features": payload.get("features", []) or [],[m
+                 "source": "generated",[m
+[32m+[m[32m                "speed": _speed_to_int(payload.get("speed", 30), default_speed=30),[m
+[32m+[m[32m                "move_left": 0,[m
+             }[m
+ [m
+[32m+[m[32m        # permitir overrides explícitos del payload (sin romper runtime hp)[m
+[32m+[m[32m        if isinstance(payload, dict):[m
+[32m+[m[32m            if "ac" in payload:[m
+[32m+[m[32m                entry["ac"] = _as_int(payload.get("ac"), entry.get("ac", 10))[m
+[32m+[m[32m            # si te pasan hp_current/max_hp explícitos[m
+[32m+[m[32m            if "max_hp" in payload or "hp_max" in payload or "hp" in payload or "hp_current" in payload:[m
+[32m+[m[32m                max_hp = _as_int(payload.get("max_hp"), _as_int(payload.get("hp_max"), _as_int(payload.get("hp"), entry.get("max_hp", 10))))[m
+[32m+[m[32m                hp_cur = _as_int(payload.get("hp_current"), max_hp)[m
+[32m+[m[32m                entry["max_hp"] = max(1, int(max_hp))[m
+[32m+[m[32m                entry["hp_current"] = max(0, int(hp_cur))[m
+[32m+[m[32m                entry["hp"] = entry["hp_current"][m
+[32m+[m[32m                entry["hp_max"] = entry["max_hp"][m
+[32m+[m
+         if name in enemies:[m
+             enemies[name].update(entry)[m
+             updated.append(name)[m
+[36m@@ -2040,7 +2261,13 @@[m [mdef tool_spawn_encounter(encounter_json: str) -> str:[m
+             created.append(name)[m
+ [m
+     canon_save(canon)[m
+[31m-    return f"SPAWN_ENCOUNTER OK\ncreated={created}\nupdated={updated}\ntotal_enemies={len(enemies)}"[m
+[32m+[m[32m    return ([m
+[32m+[m[32m        "SPAWN_ENCOUNTER OK\n"[m
+[32m+[m[32m        f"created={created}\n"[m
+[32m+[m[32m        f"updated={updated}\n"[m
+[32m+[m[32m        f"ignored={ignored}\n"[m
+[32m+[m[32m        f"total_enemies={len(enemies)}"[m
+[32m+[m[32m    )[m
+ [m
+ def tool_target_status(target: str) -> str:[m
+     canon = canon_load()[m
+[36m@@ -2181,9 +2408,28 @@[m [mdef tool_execute_actions(script: str, default_target: str = "") -> str:[m
+ [m
+     def _find_member(name: str) -> dict:[m
+         nn = _norm(name)[m
+[32m+[m[32m        # exact match[m
+         for m in members:[m
+             if _norm(m.get("name", "")) == nn:[m
+                 return m[m
+[32m+[m
+[32m+[m[32m        # fallback: match por primer token ("Kaelen" vs "Kaelen el Sombrío")[m
+[32m+[m[32m        nn_first = nn.split()[0] if nn.split() else nn[m
+[32m+[m[32m        for m in members:[m
+[32m+[m[32m            mm = _norm(m.get("name", ""))[m
+[32m+[m[32m            if mm.startswith(nn_first):[m
+[32m+[m[32m                return m[m
+[32m+[m
+[32m+[m[32m        # fuzzy match (typos tipo Kaedrel->Kaelen)[m
+[32m+[m[32m        names = [m.get("name", "") for m in members if m.get("name")][m
+[32m+[m[32m        lowered = {n.lower(): n for n in names}[m
+[32m+[m[32m        candidates = difflib.get_close_matches(nn, list(lowered.keys()), n=1, cutoff=0.72)[m
+[32m+[m[32m        if candidates:[m
+[32m+[m[32m            best = lowered[candidates[0]][m
+[32m+[m[32m            for m in members:[m
+[32m+[m[32m                if m.get("name") == best:[m
+[32m+[m[32m                    return m[m
+[32m+[m
+         return {}[m
+ [m
+     def _ability_mod(score) -> int:[m
+[36m@@ -2399,6 +2645,55 @@[m [mdef tool_execute_actions(script: str, default_target: str = "") -> str:[m
+     if not tgt:[m
+         return "No hay enemigos vivos registrados para ejecutar acciones."[m
+ [m
+[32m+[m[32m        # -------- PRE-FLIGHT: asegurar enemigos mencionados en el script --------[m
+[32m+[m[32m    def _extract_enemy_names(text: str) -> list[str]:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Detecta patrones tipo "Bandido A", "Cultista B", "Encapuchado Oscuro", etc.[m
+[32m+[m[32m        OJO: es heurístico; por eso filtramos contra party y enemigos ya registrados.[m
+[32m+[m[32m        """[m
+[32m+[m[32m        hits = set()[m
+[32m+[m
+[32m+[m[32m        # 1) cosas entre comillas "..."[m
+[32m+[m[32m        for q in re.findall(r'"([^"]+)"', text):[m
+[32m+[m[32m            q = q.strip()[m
+[32m+[m[32m            if len(q) >= 3:[m
+[32m+[m[32m                hits.add(q)[m
+[32m+[m
+[32m+[m[32m        # 2) patrón tipo "Bandido A" / "Cultista B"[m
+[32m+[m[32m        for m in re.findall(r'\b([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)\s+([A-Z])\b', text):[m
+[32m+[m[32m            hits.add(f"{m[0]} {m[1]}")[m
+[32m+[m
+[32m+[m[32m        # 3) patrón tipo "Encapuchado Oscuro" (dos palabras capitalizadas)[m
+[32m+[m[32m        for m in re.findall(r'\b([A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]+)\s+([A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]+)\b', text):[m
+[32m+[m[32m            cand = f"{m[0]} {m[1]}".strip()[m
+[32m+[m[32m            # filtra falsos positivos típicos[m
+[32m+[m[32m            if cand.lower() not in {"gran arma", "arma grande", "great weapon", "sharp shooter"}:[m
+[32m+[m[32m                hits.add(cand)[m
+[32m+[m
+[32m+[m[32m        return sorted(hits)[m
+[32m+[m
+[32m+[m[32m    mentioned = _extract_enemy_names(script)[m
+[32m+[m[32m    to_spawn = [n for n in mentioned if n not in enemies and not _find_member(n)][m
+[32m+[m[32m    if to_spawn:[m
+[32m+[m[32m        # En vez de stubs, intentamos spawn real (bestiary si hay match; si no, generado)[m
+[32m+[m[32m        spawn_items = [][m
+[32m+[m[32m        for n in to_spawn:[m
+[32m+[m[32m            # si hay bestiary match directo, spawn con name basta[m
+[32m+[m[32m            mon_def = _get_monster_def_fuzzy(n)[m
+[32m+[m[32m            if mon_def:[m
+[32m+[m[32m                spawn_items.append({"name": n})[m
+[32m+[m[32m            else:[m
+[32m+[m[32m                # fallback: generado “ligero”[m
+[32m+[m[32m                spawn_items.append({"name": n, "role": "skirmisher", "cr": 0.25})[m
+[32m+[m
+[32m+[m[32m        tool_spawn_encounter(json.dumps({"enemies": spawn_items}, ensure_ascii=False))[m
+[32m+[m
+[32m+[m[32m        # recarga canon/enemies para que ya existan en esta ejecución[m
+[32m+[m[32m        canon = canon_load()[m
+[32m+[m[32m        enemies = canon.get("enemies", {}) or {}[m
+[32m+[m[32m    # -----------------------------------------------------------------------[m
+[32m+[m
+[32m+[m
+     parts = [p.strip() for p in re.split(r"[.\n]+", script) if p.strip()][m
+     out_lines = ["EXECUTE_ACTIONS"][m
+ [m

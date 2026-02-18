@@ -6,8 +6,43 @@ info:
 servers:
   - url: https://ubiquitous-space-giggle-r49rgrw5g6qwhv9p-8000.app.github.dev
 
-components:
-  schemas: {}
+ccomponents:
+  schemas:
+    RollReq:
+      type: object
+      required: [expr]
+      properties:
+        expr: { type: string }
+        session_id: { type: string }
+        label: { type: string }
+
+    SkillCheckReq:
+      type: object
+      required: [bonus, dc]
+      properties:
+        bonus: { type: integer }
+        dc: { type: integer }
+        mode:
+          type: string
+          enum: [normal, adv, dis]
+          default: normal
+        session_id: { type: string }
+        label: { type: string }
+
+    AttackReq:
+      type: object
+      required: [attack_bonus, target_ac]
+      properties:
+        attack_bonus: { type: integer }
+        target_ac: { type: integer }
+        mode:
+          type: string
+          enum: [normal, adv, dis]
+          default: normal
+        session_id: { type: string }
+        label: { type: string }
+        damage_expr: { type: string }
+
   securitySchemes:
     ApiKeyAuth:
       type: apiKey
@@ -90,6 +125,48 @@ paths:
           required: true
           schema:
             type: string
+      responses:
+        "200":
+          description: OK
+  
+    /roll:
+    post:
+      operationId: roll
+      summary: Roll a dice expression (e.g., 2d6+3)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RollReq"
+      responses:
+        "200":
+          description: OK
+
+  /skill_check:
+    post:
+      operationId: skillCheck
+      summary: Skill/ability check with bonus vs DC (supports adv/dis)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SkillCheckReq"
+      responses:
+        "200":
+          description: OK
+
+  /attack:
+    post:
+      operationId: attack
+      summary: Attack roll vs target AC (supports adv/dis); optional damage roll
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AttackReq"
       responses:
         "200":
           description: OK

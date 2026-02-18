@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Tuple, Callable, Set
 import inspect
 from copy import deepcopy
 from pathlib import Path
+from wot_output import TurnContext, format_turn_output
+from wot_dice import roll_expr, skill_check, attack_roll
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -5453,6 +5455,10 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
     """
     global _ACTIVE_STATE
     _ACTIVE_STATE = state
+
+    # Contexto de turno para RESOLUCIÓN (mecánica) / LOG
+    ctx = TurnContext()
+
     try:
         state.history = _normalize_history_for_chat(state.history)
 
@@ -5476,7 +5482,6 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
                     canon_now
                 )
 
-            # Si detectamos combate/multi-acción pero no hay plan válido, NO caemos al DM libre.
             if not plan:
                 return (
                     "No pude construir un Action Plan JSON válido para ejecutar el motor.\n"
@@ -5489,15 +5494,20 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
             # 2) EXECUTE (motor)
             resolution = tool_resolve_actions(plan_str)
 
+            # Registrar SIEMPRE la mecánica literal del motor
+            try:
+                ctx.mech(resolution)
+            except Exception:
+                pass
+
             # 3) POST STATE
             canon_after = canon_load()
 
             # 4) NARRATE (solo texto)
             narr = _call_narrator_text(user_text, canon_after, plan, resolution)
 
-            # --- Guard-rail local (por si el narrador se “desancla”) ---
             BAD_PATTERNS = [
-                r"\b\d+\b",  # números
+                r"\b\d+\b",
                 r"puntos de daño|daño total|total de",
                 r"\bcr[ií]tico\b|\bcrit\b",
                 r"\bdc\b|\btirada\b|\bprueba\b|\bsalvaci[oó]n\b",
@@ -5505,7 +5515,6 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
                 r"seguir atacando|intimidar|negociar|reagruparse|preparar una defensa|usar alguna habilidad",
                 r"\bopciones\b",
                 r"\bdecidid\b",
-
             ]
 
             def _narr_ok(txt: str) -> bool:
@@ -5513,196 +5522,124 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
                     return False
                 low = txt.strip().lower()
                 for pat in BAD_PATTERNS:
-                    if re.search(pat, low, re.IGNORECASE):
+                    if re.search(pat, low):
                         return False
                 return True
 
-            def _hp_label(hp_cur: int, hp_max: int) -> str:
-                if hp_max <= 0:
-                    return "en pie"
-                r = hp_cur / hp_max
-                if r >= 0.85:
-                    return "casi ileso"
-                if r >= 0.55:
-                    return "herido"
-                if r >= 0.25:
-                    return "muy tocado"
-                if r > 0:
-                    return "al borde de caer"
-                return "fuera de combate"
+            if _narr_ok(narr):
+                state.history.append(_assistant_msg(narr))
+                return narr
 
-            def _fallback_narration(plan_obj: dict, canon_obj: dict) -> str:
-                acts = plan_obj.get("actions") or []
-                enemies = canon_obj.get("enemies", {}) or {}
+            # Fallback si la narración no pasó validación
+            fallback_narr = (
+                "Los eventos se desenvuelven rápidamente. Los enemigos reaccionan a vuestros movimientos, "
+                "el combate se intensifica.\n\n¿Qué hacéis ahora?"
+            )
+            state.history.append(_assistant_msg(fallback_narr))
+            return fallback_narr
 
-                # resumen cualitativo por actores/targets
-                beats = []
-                for a in acts[:8]:
-                    if not isinstance(a, dict):
-                        continue
-                    typ = (a.get("type") or "").lower()
-                    actor = (a.get("actor") or "").strip()
-                    tgt = (a.get("target") or "").strip()
-                    if typ in {"attack", "spell_attack"} and actor and tgt:
-                        beats.append(f"{actor} presiona a {tgt} con una ofensiva sostenida.")
-                    elif typ == "move" and actor:
-                        beats.append(f"{actor} se recoloca buscando mejor ángulo.")
-                    elif typ == "apply_condition":
-                        who = (a.get("target") or a.get("actor") or "").strip()
-                        if who:
-                            beats.append(f"{who} queda afectado por el estado indicado en la resolución.")
+        # =========================================================
+        # MODO NORMAL (sin planner): chat directo con function calling
+        # =========================================================
+        while True:
+            response = _call_chat_with_retries(state.history)
 
-                if not beats:
-                    beats.append("El intercambio es rápido y brutal; el aire se llena de tensión y golpes secos.")
+            # Procesa respuesta
+            finish_reason = response.choices[0].finish_reason
+            content = response.choices[0].message.content or ""
+            tool_calls = response.choices[0].message.tool_calls or []
 
-                # estado cualitativo exacto (sin cifras)
-                status_lines = []
-                for name, e in enemies.items():
-                    if not isinstance(e, dict):
-                        continue
-                    hp = e.get("hp_current", e.get("hp", None))
-                    mx = e.get("max_hp", e.get("hp_max", None))
-                    if hp is None or mx is None:
-                        continue
+            if content:
+                state.history.append(_assistant_msg(content))
+                try:
+                    ctx.narr(content)
+                except Exception:
+                    pass
+
+            if not tool_calls:
+                return content or "..."
+
+            # Ejecuta tool calls
+            tool_results = []
+            for tc in tool_calls:
+                fn_name = tc.function.name
+                args_raw = tc.function.arguments or "{}"
+                args = _parse_tool_args(args_raw)
+                args_filtered, dropped = _filter_args_to_signature(TOOLS.get(fn_name), args)
+
+                if fn_name not in TOOLS:
+                    tool_output = f"ERROR: función '{fn_name}' no existe."
+                else:
                     try:
-                        hp_i = int(hp)
-                        mx_i = int(mx)
+                        tool_output = TOOLS[fn_name](**args_filtered)
+                    except Exception as e:
+                        tool_output = f"ERROR: {e}"
+
+                tool_results.append((tc.id, tool_output))
+
+                # Log mecánica si procede
+                if fn_name in {"roll", "check", "skill_check", "attack", "damage", "heal"}:
+                    try:
+                        ctx.mech(f"{fn_name}(...)\n{tool_output}")
                     except Exception:
-                        continue
-                    conds = [c.get("name") for c in _ensure_conditions(e) if isinstance(c, dict) and c.get("name")]
-                    cond_txt = ""
-                    if conds:
-                        cond_txt = " (" + ", ".join([str(x) for x in conds]) + ")"
-                    status_lines.append(f"{name} está {_hp_label(hp_i, mx_i)}{cond_txt}.")
+                        pass
 
-                text = " ".join(beats[:3]).strip()
-                if status_lines:
-                    text += "\n\n" + " ".join(status_lines[:4]).strip()
-                text += "\n\n¿Qué hacéis ahora?"
-                return text
+            # Añade tool results al history
+            for tool_id, tool_output in tool_results:
+                state.history.append(_tool_msg(tool_id, tool_output))
 
-            if not _narr_ok(narr):
-                narr = _fallback_narration(plan, canon_after)
+            # Auto-registrar enemigos del último assistant message (si hay)
+            if content:
+                _auto_register_enemies_from_output(content)
 
-            # corta cualquier cosa que venga después de la pregunta final
-            q = "¿Qué hacéis ahora?"
-            if isinstance(narr, str) and q in narr:
-                narr = narr[:narr.rfind(q) + len(q)]
-
-            # 5) Estado exacto (PV/condiciones) + mecánica si debug
-            status = _enemy_status_summary(canon_after)
-            status_block = ("ESTADO (post-resolución)\n```text\n" + status + "\n```\n\n") if status else ""
-
-            debug_mech = False
-            try:
-                debug_mech = bool(state.flags.get("debug_mechanics", False)) if isinstance(state.flags, dict) else False
-            except Exception:
-                debug_mech = False
-
-            if debug_mech:
-                final = (
-                    "RESOLUCIÓN (mecánica)\n```text\n" + resolution + "\n```\n\n"
-                    + status_block
-                    + (narr or "").strip()
-                )
-            else:
-                final = status_block + (narr or "").strip()
-
-            # Persistir en history para continuidad
-            state.history.append(_assistant_msg(final))
-
-            # (opcional) log a session.md para auditoría
-            try:
-                tool_log_event("=== TURN ===\nPLAN:\n" + plan_str + "\n\nRESOLUTION:\n" + resolution + "\n\n")
-            except Exception:
+            canon_now = canon_load()
+            if canon_now.get("combat", {}).get("active"):
+                # Sugerencia: usa combat_status, next_turn, etc.
                 pass
 
-            return final
-        # =========================================================
+    except RuntimeError as e:
+        error_msg = str(e)
+        if "OPENAI_ERROR" in error_msg:
+            return f"⚠️ Error de API OpenAI:\n{error_msg}"
+        raise
 
-        try:
-            resp = _call_chat_with_retries(state.history)
-        except Exception as e:
-            return f"Error llamando al modelo: {e}"
-
-        while True:
-            msg = resp.choices[0].message
-
-            # 1) Si hay tool calls, ejecútalas
-            tool_calls = getattr(msg, "tool_calls", None) or []
-            if tool_calls:
-                # guarda el mensaje del assistant tal cual (con tool_calls)
-                state.history.append({
-                    "role": "assistant",
-                    "content": msg.content or "",
-                    "tool_calls": [tc.model_dump() if hasattr(tc, "model_dump") else tc for tc in tool_calls],
-                })
-
-                for tc in tool_calls:
-                    tc_id = tc.id
-                    fn_name = tc.function.name
-                    fn_args = _parse_tool_args(tc.function.arguments)
-
-                    fn = TOOLS.get(fn_name)
-                    if not fn:
-                        out = f"Error: herramienta '{fn_name}' no existe en TOOLS."
-                    else:
-                        filtered_args, dropped = _filter_args_to_signature(fn, fn_args)
-                        try:
-                            out = fn(**filtered_args)
-                            if dropped:
-                                out = f"{out}\n(WARN: args ignorados por no estar en la firma: {dropped})"
-                        except Exception as e:
-                            out = f"Error ejecutando {fn_name}: {e}"
-
-                    state.history.append(_tool_msg(tc_id, str(out)))
-
-                # 2) vuelve a llamar al modelo con tool outputs ya en messages
-                try:
-                    resp = _call_chat_with_retries(state.history)
-                except Exception as e:
-                    return f"Error llamando al modelo tras tools: {e}"
-
-                continue
-
-            # 3) Sin tools: devuelve texto final
-            text = (msg.content or "").strip()
-            if text:
-                # Si el modelo describe impactos/daño/condiciones sin tools, forzamos 1 retry pidiendo tiradas visibles
-                needs_mechanics = bool(re.search(r"\b(impacta|falla|daño|d20|tirada|crítico|crit|prone|paralyzed|paralizado|derribado)\b", text, re.IGNORECASE))
-                has_mech_section = ("RESOLUCIÓN" in text.upper()) or ("MECÁNICA" in text.upper())
-
-                if needs_mechanics and not has_mech_section:
-                    _auto_register_enemies_from_output(text)
-                    state.history.append(_assistant_msg(text))
-                    state.history.append(_user_msg(
-                        "Rehaz la resolución usando herramientas mecánicas: "
-                        "para ataques usa tool_attack (una vez por ataque), "
-                        "para daño usa tool_roll, y para condiciones usa tool_apply_condition/target_status. "
-                        "Incluye SIEMPRE una sección RESOLUCIÓN (mecánica) pegando el output literal de las tools."
-                    ))
-                    try:
-                        resp = _call_chat_with_retries(state.history)
-                        msg2 = resp.choices[0].message
-                        text2 = (msg2.content or "").strip()
-                        if text2:
-                            _auto_register_enemies_from_output(text2)
-                            state.history.append(_assistant_msg(text2))
-                            return text2
-                    except Exception as e:
-                        return f"Error llamando al modelo tras retry tiradas visibles: {e}"
-
-                state.history.append(_assistant_msg(text))
-                return text
-
-            # recorta cualquier “menú” después de la pregunta final
-            q = "¿Qué hacéis?"
-            if q in final:
-                final = final[:final.rfind(q) + len(q)]
-
-            return "(Sin salida de texto; revisa el prompt/tools.)"
     finally:
         _ACTIVE_STATE = None
+        try:
+            ctx.dump()
+        except Exception:
+            pass
+
+def run_turn_wot(session_id: str, user_text: str, session_state: dict) -> str:
+    ctx = TurnContext()
+
+    # 1) Tu lógica decide si hay tiradas o no.
+    # EJEMPLO: si el jugador dice "registro la sala", haces check percepción CD 15 con bono +6
+    if "registro" in user_text.lower():
+        ok, total, txt, raw = skill_check(bonus=6, dc=15, mode="normal")
+        ctx.mech(f"Percepción (CD 15, bono +6): {txt}")
+        if ok:
+            narration = "Registras cada rincón con calma operativa. Algo no encaja: una corriente mínima de aire delata una junta oculta."
+            interpretation = "Superas la CD: encuentras un indicio útil sin alertar a nadie."
+            options = ["Inspeccionar la junta con herramientas", "Marcar el punto y avanzar", "Llamar al Warder para cubrir el pasillo"]
+            ctx.log_event("Hallazgo: posible puerta/panel oculto detectado.")
+        else:
+            narration = "Buscas a conciencia, pero el polvo y la geometría del lugar te engañan: no detectas nada concluyente."
+            interpretation = "Fallas la CD: no obtienes información adicional."
+            options = ["Repetir con más tiempo (riesgo de retraso)", "Cambiar el ángulo de luz / antorcha", "Avanzar con cautela"]
+    else:
+        # Turno sin tiradas
+        narration = "Anotas el plan y ajustas la formación. Todo queda listo para ejecutar."
+        interpretation = "No hay resolución aleatoria en este paso."
+        options = ["AVANZA: entramos", "AVANZA: hablamos con el guardia", "ESTADO"]
+
+    # 2) SIEMPRE devuelve el formato fijo con RESOLUCIÓN (mecánica)
+    return format_turn_output(
+        ctx=ctx,
+        interpretation=interpretation,
+        narration=narration,
+        options=options,
+    )
 
 # =========================================================
 # CLI (robusto + modo local)

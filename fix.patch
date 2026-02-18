@@ -1,0 +1,259 @@
+--- agent.py
++++ agent.py
+@@ -1093,8 +1093,13 @@
+     applied_ids: set[str] = set()
+ 
+     mods = get_modifiers_compendium() or []
++    # Evita que un modifiers.json mal configurado rompa reglas base.
++    IGNORE_BUILTIN_MODS = {"sharpshooter", "gwm", "great_weapon_master"}
+     for m in mods:
+         if not isinstance(m, dict):
++            continue
++        mid_norm = _norm(m.get("id") or m.get("name") or "")
++        if mid_norm in IGNORE_BUILTIN_MODS:
+             continue
+         when = (m.get("when") or "").strip().lower()
+         if when != "attack":
+@@ -1190,6 +1195,113 @@
+     if not monster_id:
+         return None
+     return (comp.get("monsters") or {}).get(monster_id)
++
++# =========================================================
++# Spell-save helpers (para conjuros a salvación: Hypnotic Pattern, etc.)
++# =========================================================
++_SAVE_WORD_TO_ABILITY = {
++    "strength": "str",
++    "dexterity": "dex",
++    "constitution": "con",
++    "intelligence": "int",
++    "wisdom": "wis",
++    "charisma": "cha",
++}
++
++_SAVE_RE = re.compile(r"\b(Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)\s+saving\s+throw\b", re.IGNORECASE)
++
++
++def _infer_save_ability_from_spell_def(spell_def: Optional[dict]) -> Optional[str]:
++    """Intenta inferir la habilidad de salvación leyendo el texto del conjuro."""
++    if not spell_def:
++        return None
++    txt = spell_def.get("text")
++    parts = []
++    if isinstance(txt, list):
++        parts = [str(x) for x in txt if x]
++    elif isinstance(txt, str):
++        parts = [txt]
++    blob = "\n".join(parts)
++    m = _SAVE_RE.search(blob)
++    if not m:
++        return None
++    word = m.group(1).strip().lower()
++    return _SAVE_WORD_TO_ABILITY.get(word)
++
++
++def _spell_duration_to_rounds(spell_def: Optional[dict], fallback_rounds: int = 1) -> int:
++    """Convierte duration tipo 'up to 1 minute' a rondas (aprox)."""
++    if not spell_def:
++        return fallback_rounds
++    dur = (spell_def.get("duration") or "").strip().lower()
++    if "minute" in dur:
++        return 10
++    if "hour" in dur:
++        return 600
++    if "round" in dur:
++        m = re.search(r"(\d+)", dur)
++        if m:
++            try:
++                return max(1, int(m.group(1)))
++            except Exception:
++                pass
++    return fallback_rounds
++
++
++def _get_entity_ability_score(canon: dict, name: str, ability: str) -> int:
++    """Devuelve score (STR/DEX/...) desde party/enemies, o 10 si no se sabe."""
++    ability = _norm(ability)
++    pm = _find_party_member(canon, name)
++    if pm and isinstance(pm.get("abilities"), dict):
++        try:
++            return int(pm["abilities"].get(ability, 10) or 10)
++        except Exception:
++            return 10
++
++    fe = _find_enemy(canon, name)
++    if fe:
++        _, obj = fe
++        try:
++            return int(obj.get(ability, 10) or 10)
++        except Exception:
++            return 10
++
++    return 10
++
++
++def _get_save_bonus(canon: dict, name: str, ability: str) -> int:
++    """Bonus de salvación (heurístico): mod(ability)."""
++    score = _get_entity_ability_score(canon, name, ability)
++    return _ability_mod(score)
++
++
++def _calc_spell_save_dc(canon: dict, actor: str, override: Optional[int] = None) -> int:
++    """DC del conjuro: override si viene; si no, usa actor.spell_save_dc o 8+PB+mod(ability) heurístico."""
++    if override is not None:
++        try:
++            v = int(override)
++            if 1 <= v <= 30:
++                return v
++        except Exception:
++            pass
++
++    pm = _find_party_member(canon, actor)
++    if pm:
++        try:
++            v = int(pm.get("spell_save_dc", 0) or 0)
++            if 1 <= v <= 30:
++                return v
++        except Exception:
++            pass
++
++        pb = int(pm.get("prof_bonus", 0) or 0)
++        abilities = pm.get("abilities", {}) if isinstance(pm.get("abilities"), dict) else {}
++        best = max(_ability_mod(abilities.get("int", 10)), _ability_mod(abilities.get("wis", 10)), _ability_mod(abilities.get("cha", 10)))
++        dc = 8 + pb + best
++        return max(8, min(30, dc))
++
++    return 13
+@@ -4562,6 +4674,11 @@
+ _NARRATION_BAD_PATTERNS = [
+     r"\bbonus\b",
+     r"\bda[nñ]o\b",
+     r"\bdc\b",
+     r"\bts\b",
+     r"\btiro\b",
+     r"\btirada\b",
+     r"\b1d\d+\b",
+     r"\b\d+d\d+\b",
+     r"\b\d+\b",
+     r"\bcr[ií]tico\b",
++    r"resoluci[oó]n",
++    r"mec[aá]nica",
++    r"interpretaci[oó]n",
+ ]
+@@ -5486,6 +5603,21 @@
+         user_text = _preprocess_user_text(user_text)
+ 
++        # -----------------------------
++        # Comandos rápidos de debug (persisten en session flags)
++        #   /debug on  -> muestra RESOLUCIÓN (mecánica) real del motor
++        #   /debug off -> oculta la resolución y deja solo narración
++        # -----------------------------
++        cmd = (user_text or "").strip().lower()
++        if cmd in {"/debug on", "/debug mech on", "/debug_mechanics on"}:
++            state.flags["debug_mechanics"] = True
++            return "OK. debug_mechanics=ON"
++        if cmd in {"/debug off", "/debug mech off", "/debug_mechanics off"}:
++            state.flags["debug_mechanics"] = False
++            return "OK. debug_mechanics=OFF"
++
+         # Append to history
+         state.history.append({"role": "user", "content": user_text})
+@@ -5515,6 +5647,11 @@
+         BAD_PATTERNS = [
+             r"\bbonus\b",
+             r"\bda[nñ]o\b",
+             r"\bdc\b",
+             r"\bts\b",
+             r"\btiro\b",
+             r"\btirada\b",
+             r"\b1d\d+\b",
+             r"\b\d+d\d+\b",
+             r"\b\d+\b",
+             r"\bcr[ií]tico\b",
++            r"resoluci[oó]n",
++            r"mec[aá]nica",
++            r"interpretaci[oó]n",
+         ]
+@@ -3679,6 +3816,70 @@
+-        if typ in {"attack", "spell_attack"}:
++        if typ == "spell_save":
++            actor = str(a.get("actor", "")).strip()
++            spell_name = str(a.get("spell", "")).strip()
++            targets = a.get("targets")
++            if not isinstance(targets, list):
++                t1 = str(a.get("target", "")).strip()
++                targets = [t1] if t1 else []
++            targets = [str(t).strip() for t in targets if str(t).strip()]
++
++            if not actor or not spell_name or not targets:
++                out.append(f"[{i}] ERROR spell_save: faltan campos (actor/spell/targets).")
++                continue
++
++            # Asegurar targets
++            for tname in targets:
++                _ensure_target_exists(canon_now, tname)
++
++            spdef = _get_spell_def_by_name(spell_name)
++            save = a.get("save")
++            save = _norm(save) if save else None
++            if save and save in {"strength","dexterity","constitution","intelligence","wisdom","charisma"}:
++                save = _SAVE_WORD_TO_ABILITY.get(save)
++            if save and save not in {"str","dex","con","int","wis","cha"}:
++                save = None
++            if not save:
++                save = _infer_save_ability_from_spell_def(spdef) or "wis"
++
++            dc = _calc_spell_save_dc(canon_now, actor, a.get("dc"))
++
++            on_fail = a.get("on_fail") if isinstance(a.get("on_fail"), dict) else {}
++            conds = on_fail.get("apply_conditions") if isinstance(on_fail.get("apply_conditions"), list) else []
++            try:
++                rounds = int(on_fail.get("rounds"))
++            except Exception:
++                rounds = _spell_duration_to_rounds(spdef, fallback_rounds=1)
++
++            if not conds and _norm(spell_name) in {"hypnotic pattern","hypnotic_pattern"}:
++                conds = ["CHARMED", "INCAPACITATED", "SPEED_0"]
++                rounds = _spell_duration_to_rounds(spdef, fallback_rounds=10)
++
++            out.append(f"[{i}] SPELL_SAVE {actor} -> {spell_name} | SAVE {save.upper()} DC {dc} | targets={targets}")
++            for tname in targets:
++                bonus = _get_save_bonus(canon_now, tname, save)
++                r = random.randint(1, 20)
++                total = r + bonus
++                ok = total >= dc
++                out.append(f"    - {tname}: d20={r} + {bonus} = {total} -> {'ÉXITO' if ok else 'FALLO'}")
++
++                if (not ok) and conds:
++                    found = _get_target_container(canon_now, tname)
++                    if found:
++                        _, obj, _cname = found
++                        c_list = _ensure_conditions(obj)
++                        for cc in conds:
++                            name_cc = str(cc).strip().upper()
++                            if not name_cc:
++                                continue
++                            existing = None
++                            for c in c_list:
++                                if str(c.get("name", "")).upper() == name_cc:
++                                    existing = c
++                                    break
++                            if existing:
++                                existing["remaining"] = max(int(existing.get("remaining", 0) or 0), rounds)
++                            else:
++                                c_list.append({"name": name_cc, "remaining": rounds})
++
++            # Nota: no modelamos todavía 'se rompe si recibe daño' (Hypnotic Pattern)
++            canon_save(canon_now)
++            continue
++
++        if typ in {"attack", "spell_attack"}:
+             # ... (resto igual)
+@@ -4709,6 +4910,11 @@
+ - spell_attack (por ahora cantrips tipo Fire Bolt):
+   {"type":"spell_attack","actor":"<name>","target":"<name>","spell":"Fire Bolt",
+    "roll_mode":"auto|normal|adv|dis (opcional)"}
++- spell_save (conjuros a salvación, ej. Hypnotic Pattern):
++  {"type":"spell_save","actor":"<name>","spell":"Hypnotic Pattern","targets":["A","B"],
++   "save":"wis","dc":15 (opcional, si se conoce),
++   "on_fail":{"apply_conditions":["CHARMED","INCAPACITATED","SPEED_0"],"rounds":10} (opcional)}

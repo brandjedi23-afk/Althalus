@@ -1,14 +1,21 @@
 # server.py
 import os
+import re
 import json
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
+
+# Endpoints mecánicos WoT
+from wot_dice import roll_expr, skill_check as _skill_check, attack_roll as _attack_roll
+
+# (No es estrictamente necesario aquí, pero lo dejas importado si lo usas en otros sitios)
+from wot_output import TurnContext, format_turn_output  # noqa: F401
 
 # -----------------------------
 # Paths estables + .env
@@ -24,8 +31,10 @@ SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 # -----------------------------
 PUBLIC_PATHS = {"/", "/favicon.ico", "/health", "/config", "/docs", "/openapi.json", "/redoc"}
 
+
 def _get_api_token() -> str:
     return (os.getenv("DM_API_TOKEN") or "").strip()
+
 
 def _auth_ok(request: Request, token: str) -> bool:
     # Authorization: Bearer <token>  OR  X-API-KEY: <token>
@@ -37,6 +46,7 @@ def _auth_ok(request: Request, token: str) -> bool:
     if xkey:
         return xkey.strip() == token
     return False
+
 
 # -----------------------------
 # Import tolerante del agente
@@ -65,6 +75,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.middleware("http")
 async def require_token(request: Request, call_next):
     path = request.url.path
@@ -81,6 +92,7 @@ async def require_token(request: Request, call_next):
 
     return await call_next(request)
 
+
 # -----------------------------
 # Modelos
 # -----------------------------
@@ -88,9 +100,139 @@ class TurnRequest(BaseModel):
     session_id: str
     text: str
 
+
 class TurnResponse(BaseModel):
     session_id: str
     output: str
+
+
+# =============================
+# (4.1) Endpoints mecánicos WoT
+# =============================
+Mode = Literal["normal", "adv", "dis"]
+
+
+class RollReq(BaseModel):
+    expr: str
+    session_id: Optional[str] = None
+    label: Optional[str] = None
+
+
+class SkillCheckReq(BaseModel):
+    bonus: int
+    dc: int
+    mode: Mode = "normal"
+    session_id: Optional[str] = None
+    label: Optional[str] = None
+
+
+class AttackReq(BaseModel):
+    attack_bonus: int
+    target_ac: int
+    mode: Mode = "normal"
+    session_id: Optional[str] = None
+    label: Optional[str] = None
+    damage_expr: Optional[str] = None  # opcional: si impacta, tira daño
+
+
+def _events_path(session_id: str) -> Path:
+    safe = "".join(ch for ch in (session_id or "") if ch.isalnum() or ch in ("-", "_")).strip()
+    if not safe:
+        safe = "default"
+    return SESSIONS_DIR / f"{safe}.events.jsonl"
+
+
+def _append_session_event(session_id: str, kind: str, payload: Dict[str, Any]) -> None:
+    """
+    Log ligero en JSONL para auditoría mecánica sin tocar el state JSON principal
+    (evita conflictos con save/load del AgentState).
+    """
+    try:
+        from datetime import datetime, timezone
+        p = _events_path(session_id)
+        event = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "kind": kind,
+            "payload": payload,
+        }
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception:
+        # logging no debe romper la respuesta
+        pass
+
+
+@app.post("/roll", operation_id="roll")
+def roll_endpoint(req: RollReq):
+    r = roll_expr(req.expr)
+    text = f"{req.label + ': ' if req.label else ''}{r.detail}"
+
+    if req.session_id:
+        _append_session_event(
+            req.session_id,
+            "roll",
+            {"expr": req.expr, "detail": r.detail, "total": r.total, "label": req.label},
+        )
+
+    return {"total": r.total, "detail": r.detail, "text": text, "raw": r.raw}
+
+
+@app.post("/skill_check", operation_id="skillCheck")
+def skill_check_endpoint(req: SkillCheckReq):
+    ok, total, txt, raw = _skill_check(bonus=req.bonus, dc=req.dc, mode=req.mode)
+    text = f"{req.label + ': ' if req.label else ''}{txt}"
+
+    if req.session_id:
+        _append_session_event(
+            req.session_id,
+            "skill_check",
+            {"bonus": req.bonus, "dc": req.dc, "mode": req.mode, "ok": ok, "total": total, "label": req.label},
+        )
+
+    return {"ok": ok, "total": total, "text": text, "raw": raw}
+
+
+@app.post("/attack", operation_id="attack")
+def attack_endpoint(req: AttackReq):
+    hit, crit, total, txt, raw = _attack_roll(
+        attack_bonus=req.attack_bonus,
+        target_ac=req.target_ac,
+        mode=req.mode,
+    )
+
+    out: Dict[str, Any] = {
+        "hit": hit,
+        "crit": crit,
+        "total": total,
+        "text": (req.label + ": " if req.label else "") + txt,
+        "raw": raw,
+    }
+
+    # Daño opcional: solo si impacta y hay expresión de daño
+    if hit and req.damage_expr:
+        dmg = roll_expr(req.damage_expr)
+        out["damage_total"] = dmg.total
+        out["damage_detail"] = dmg.detail
+        out["damage_raw"] = dmg.raw
+
+    if req.session_id:
+        _append_session_event(
+            req.session_id,
+            "attack",
+            {
+                "attack_bonus": req.attack_bonus,
+                "target_ac": req.target_ac,
+                "mode": req.mode,
+                "hit": hit,
+                "crit": crit,
+                "total": total,
+                "damage_expr": req.damage_expr,
+                "label": req.label,
+            },
+        )
+
+    return out
+
 
 # -----------------------------
 # Sesiones
@@ -100,6 +242,7 @@ def _session_path(session_id: str) -> Path:
     if not safe:
         safe = "default"
     return SESSIONS_DIR / f"{safe}.json"
+
 
 def load_state(session_id: str):
     if not AgentState:
@@ -140,6 +283,7 @@ def load_state(session_id: str):
 
     return st
 
+
 def save_state(session_id: str, state) -> None:
     p = _session_path(session_id)
 
@@ -153,6 +297,7 @@ def save_state(session_id: str, state) -> None:
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(p)
+
 
 # -----------------------------
 # Runtime checks
@@ -171,6 +316,7 @@ def _check_runtime_ready() -> Dict[str, Any]:
 
     return {"ok": True, "model": model}
 
+
 # -----------------------------
 # Endpoints públicos
 # -----------------------------
@@ -178,9 +324,11 @@ def _check_runtime_ready() -> Dict[str, Any]:
 def root() -> Dict[str, Any]:
     return {"ok": True, "service": "Althalus DM Agent API"}
 
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True, "ready": _check_runtime_ready()}
+
 
 @app.get("/config")
 def config() -> Dict[str, Any]:
@@ -194,14 +342,16 @@ def config() -> Dict[str, Any]:
         "root": str(ROOT),
     }
 
+
 @app.get("/favicon.ico")
 def favicon():
     return Response(status_code=204)
 
+
 # -----------------------------
-# Turno DM
+# Turno DM (PERMISIVO + EXTRACTOR)
 # -----------------------------
-@app.post("/turn", response_model=TurnResponse)
+@app.post("/turn", response_model=TurnResponse, operation_id="turn")
 def turn(req: TurnRequest):
     if AGENT_IMPORT_ERROR or not AgentState or not run_agent_turn:
         raise HTTPException(status_code=503, detail=f"Agente no disponible: {AGENT_IMPORT_ERROR}")
@@ -218,7 +368,7 @@ def turn(req: TurnRequest):
         raise HTTPException(status_code=503, detail="Agente no inicializado")
 
     try:
-        output = run_agent_turn(req.text, state)
+        raw_output = run_agent_turn(req.text, state)
     except RuntimeError as e:
         msg = str(e)
         if "OPENAI_MODEL" in msg or "OPENAI_API_KEY" in msg:
@@ -227,8 +377,128 @@ def turn(req: TurnRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error interno: {e}")
 
-    save_state(req.session_id, state)
-    return TurnResponse(session_id=req.session_id, output=str(output))
+    # Guardar sesión
+    try:
+        save_state(req.session_id, state)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error guardando sesión: {e}")
+
+    text = str(raw_output or "").strip()
+
+    def _has_resolution_block(t: str) -> bool:
+        up = t.upper()
+        return ("RESOLUCIÓN" in up) and ("MECÁNICA" in up)
+
+    # Heurística: keywords/patrones mecánicos (sin inventar números)
+    MECH_PAT = re.compile(
+        r"("
+        r"\bd20\b|"
+        r"\bcd\b|"
+        r"\btirada\b|"
+        r"\bprueba\b|"
+        r"\bdañ(?:o|os)\b|"
+        r"\bimpacta\b|\bfalla\b|"
+        r"\bcr[ií]tico\b|\bcrit\b|"
+        r"\bsalvaci[oó]n\b|\bts\b|"
+        r"\biniciativa\b|"
+        r"\bconcentraci[oó]n\b|"
+        r"\bcondici[oó]n\b|"
+        r"\bpv\b|\bhp\b|"
+        r"\bprone\b|\bparalyzed\b|\bparalizado\b|\bderribado\b|"
+        r"\b\d+d\d+\b"
+        r")",
+        re.IGNORECASE,
+    )
+
+    def _split_into_chunks(t: str) -> list[str]:
+        """
+        Divide el texto en 'chunks' para extracción:
+        - respeta saltos de línea si existen
+        - si no, intenta separar por frases (.!? ¿?)
+        """
+        if "\n" in t:
+            return [ln.strip() for ln in t.splitlines() if ln.strip()]
+        # separa por fin de frase o saltos fuertes
+        parts = re.split(r"(?<=[\.\!\?\u00BF\u00A1])\s+", t.strip())
+        return [p.strip() for p in parts if p and p.strip()]
+
+    def _extract_mechanics_and_narration(t: str) -> tuple[list[str], str]:
+        """
+        Extrae chunks con patrón mecánico -> mechanics_lines
+        El resto -> narration_text
+        Manejo simple de bloques ```...```: si contienen keywords, se tratan como mecánica.
+        """
+        mechanics_lines: list[str] = []
+        narration_chunks: list[str] = []
+
+        # Si hay bloques de código, extrae por bloques primero
+        if "```" in t:
+            # Particiona conservando delimitadores
+            segments = re.split(r"(```.*?```)", t, flags=re.DOTALL)
+            for seg in segments:
+                if not seg or not seg.strip():
+                    continue
+                if seg.startswith("```") and seg.endswith("```"):
+                    # bloque literal
+                    if MECH_PAT.search(seg):
+                        mechanics_lines.append(seg.strip())
+                    else:
+                        narration_chunks.append(seg.strip())
+                else:
+                    # texto normal
+                    for ch in _split_into_chunks(seg):
+                        if MECH_PAT.search(ch):
+                            mechanics_lines.append(ch)
+                        else:
+                            narration_chunks.append(ch)
+        else:
+            for ch in _split_into_chunks(t):
+                if MECH_PAT.search(ch):
+                    mechanics_lines.append(ch)
+                else:
+                    narration_chunks.append(ch)
+
+        narration_text = "\n".join(narration_chunks).strip()
+        return mechanics_lines, narration_text
+
+    # Si ya viene formateado, lo devolvemos tal cual
+    if _has_resolution_block(text):
+        return TurnResponse(session_id=req.session_id, output=text)
+
+    # Permisivo + extractor: envolvemos SIEMPRE
+    ctx = TurnContext()
+    mech_lines, narration_text = _extract_mechanics_and_narration(text)
+
+    if mech_lines:
+        # Volcar lo extraído a RESOLUCIÓN (mecánica) sin inventar nada
+        for ln in mech_lines[:80]:  # límite de seguridad
+            try:
+                ctx.mech(ln)
+            except Exception:
+                pass
+        try:
+            ctx.log_event("WARN: salida original sin bloque 'RESOLUCIÓN (mecánica)'; mecánica extraída automáticamente.")
+        except Exception:
+            pass
+    else:
+        # sin mecánica visible
+        narration_text = narration_text or text
+        try:
+            ctx.log_event("Salida envuelta en formato fijo (sin mecánica visible).")
+        except Exception:
+            pass
+
+    wrapped = format_turn_output(
+        ctx=ctx,  # si no hay mech_lines, quedará "(sin tiradas)" por tu formateador
+        interpretation=(
+            "Salida envuelta en formato fijo. "
+            "Si hay discrepancias, ajusta el agente para emitir 'RESOLUCIÓN (mecánica)' de origen."
+        ),
+        narration=narration_text if narration_text else "(sin salida de texto)",
+        options=[],
+    )
+    return TurnResponse(session_id=req.session_id, output=wrapped)
+
 
 # -----------------------------
 # Reset sesión (path param - fiable para Actions)
@@ -242,10 +512,19 @@ def session_reset_path(session_id: str) -> Dict[str, Any]:
     if p.exists():
         p.unlink()
 
+    # opcional: limpia también log de eventos
+    ep = _events_path(session_id)
+    if ep.exists():
+        try:
+            ep.unlink()
+        except Exception:
+            pass
+
     return {"ok": True, "session_id": session_id}
 
+
 # -----------------------------
-# Dump sesión (AHORA incluye scene/flags/module_progress)
+# Dump sesión (incluye scene/flags/module_progress)
 # -----------------------------
 @app.get("/session/{session_id}")
 def session_dump(session_id: str) -> Dict[str, Any]:
