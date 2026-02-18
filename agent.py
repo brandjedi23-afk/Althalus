@@ -5483,11 +5483,18 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
                 )
 
             if not plan:
-                return (
-                    "No pude construir un Action Plan JSON válido para ejecutar el motor.\n"
-                    "Repite tus acciones en formato breve: Actor -> acción -> objetivo (y conteos), por ejemplo:\n"
-                    "“Myrmyr: ataque x3 a Bandit A (sharpshooter). Kaelen: ataque x2 a Bandit A (sneak_attack).”"
+                output = format_turn_output(
+                    ctx=ctx,
+                    interpretation="No se pudo construir un plan ejecutable.",
+                    narration=(
+                        "No pude construir un Action Plan JSON válido para ejecutar el motor.\n"
+                        "Repite tus acciones en formato breve: Actor -> acción -> objetivo (y conteos), por ejemplo:\n"
+                        "“Myrmyr: ataque x3 a Bandit A (sharpshooter). Kaelen: ataque x2 a Bandit A (sneak_attack).”"
+                    ),
+                    options=[],
                 )
+                state.history.append(_assistant_msg(output))
+                return output
 
             plan_str = json.dumps(plan, ensure_ascii=False)
 
@@ -5526,38 +5533,65 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
                         return False
                 return True
 
-            if _narr_ok(narr):
-                state.history.append(_assistant_msg(narr))
-                return narr
+            if not _narr_ok(narr):
+                narr = (
+                    "Los eventos se desenvuelven rápidamente. Los enemigos reaccionan a vuestros movimientos, "
+                    "el combate se intensifica.\n\n¿Qué hacéis ahora?"
+                )
 
-            # Fallback si la narración no pasó validación
-            fallback_narr = (
-                "Los eventos se desenvuelven rápidamente. Los enemigos reaccionan a vuestros movimientos, "
-                "el combate se intensifica.\n\n¿Qué hacéis ahora?"
+            # ✅ SIEMPRE: salida con formato fijo (incluye RESOLUCIÓN (mecánica))
+            output = format_turn_output(
+                ctx=ctx,
+                interpretation="El motor ejecutó el plan y aplicó los cambios de estado correspondientes.",
+                narration=(narr or "").strip() or "(sin narración)",
+                options=[
+                    "AVANZA: indica tu siguiente acción (intención + prioridades + 'si... entonces...')",
+                    "ESTADO",
+                    "RESET",
+                ],
             )
-            state.history.append(_assistant_msg(fallback_narr))
-            return fallback_narr
+
+            # Persistir en history para continuidad
+            state.history.append(_assistant_msg(output))
+
+            # (opcional) log a session.md para auditoría
+            try:
+                tool_log_event("=== TURN ===\nPLAN:\n" + plan_str + "\n\nRESOLUTION:\n" + resolution + "\n\n")
+            except Exception:
+                pass
+
+            return output
 
         # =========================================================
         # MODO NORMAL (sin planner): chat directo con function calling
         # =========================================================
+        last_narration = ""
         while True:
             response = _call_chat_with_retries(state.history)
 
             # Procesa respuesta
-            finish_reason = response.choices[0].finish_reason
-            content = response.choices[0].message.content or ""
-            tool_calls = response.choices[0].message.tool_calls or []
+            msg = response.choices[0].message
+            content = (msg.content or "").strip()
+            tool_calls = getattr(msg, "tool_calls", None) or []
 
             if content:
+                last_narration = content
                 state.history.append(_assistant_msg(content))
-                try:
-                    ctx.narr(content)
-                except Exception:
-                    pass
 
             if not tool_calls:
-                return content or "..."
+                # ✅ SIEMPRE: salida con formato fijo (aunque no haya tiradas)
+                output = format_turn_output(
+                    ctx=ctx,
+                    interpretation="Turno resuelto.",
+                    narration=last_narration or "(sin salida de texto)",
+                    options=[
+                        "AVANZA: siguiente acción",
+                        "ESTADO",
+                    ],
+                )
+                # Nota: no añadimos output al history para no “doblar” el mensaje del assistant.
+                # Si quieres consistencia total en history, comenta el append anterior y añade solo este.
+                return output
 
             # Ejecuta tool calls
             tool_results = []
@@ -5565,20 +5599,25 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
                 fn_name = tc.function.name
                 args_raw = tc.function.arguments or "{}"
                 args = _parse_tool_args(args_raw)
-                args_filtered, dropped = _filter_args_to_signature(TOOLS.get(fn_name), args)
 
-                if fn_name not in TOOLS:
+                fn = TOOLS.get(fn_name)
+                if not fn:
                     tool_output = f"ERROR: función '{fn_name}' no existe."
-                else:
-                    try:
-                        tool_output = TOOLS[fn_name](**args_filtered)
-                    except Exception as e:
-                        tool_output = f"ERROR: {e}"
+                    tool_results.append((tc.id, tool_output))
+                    continue
+
+                args_filtered, dropped = _filter_args_to_signature(fn, args)
+                try:
+                    tool_output = fn(**args_filtered)
+                    if dropped:
+                        tool_output = f"{tool_output}\n(WARN: args ignorados por no estar en la firma: {dropped})"
+                except Exception as e:
+                    tool_output = f"ERROR: {e}"
 
                 tool_results.append((tc.id, tool_output))
 
                 # Log mecánica si procede
-                if fn_name in {"roll", "check", "skill_check", "attack", "damage", "heal"}:
+                if fn_name in {"roll", "check", "skill_check", "attack", "damage", "heal", "apply_condition", "remove_condition"}:
                     try:
                         ctx.mech(f"{fn_name}(...)\n{tool_output}")
                     except Exception:
@@ -5586,11 +5625,11 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
 
             # Añade tool results al history
             for tool_id, tool_output in tool_results:
-                state.history.append(_tool_msg(tool_id, tool_output))
+                state.history.append(_tool_msg(tool_id, str(tool_output)))
 
             # Auto-registrar enemigos del último assistant message (si hay)
-            if content:
-                _auto_register_enemies_from_output(content)
+            if last_narration:
+                _auto_register_enemies_from_output(last_narration)
 
             canon_now = canon_load()
             if canon_now.get("combat", {}).get("active"):
@@ -5600,11 +5639,19 @@ def run_agent_turn(user_text: str, state: AgentState) -> str:
     except RuntimeError as e:
         error_msg = str(e)
         if "OPENAI_ERROR" in error_msg:
-            return f"⚠️ Error de API OpenAI:\n{error_msg}"
+            output = format_turn_output(
+                ctx=ctx,
+                interpretation="Error de API.",
+                narration=f"⚠️ Error de API OpenAI:\n{error_msg}",
+                options=[],
+            )
+            return output
         raise
 
     finally:
         _ACTIVE_STATE = None
+        # No llames a ctx.dump() si tu TurnContext no lo implementa.
+        # Si existe, mantenlo; si no, quítalo para evitar ruido.
         try:
             ctx.dump()
         except Exception:
