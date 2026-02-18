@@ -1,10 +1,10 @@
 openapi: 3.1.0
 info:
-  title: DM Agent API
+  title: WOT DM Agent API
   version: "1.2.2"
 
 servers:
-  - url: https://ubiquitous-space-giggle-r49rgrw5g6qwhv9p-8000.app.github.dev
+  - url: https://TU-DOMINIO-AQUI
 
 components:
   securitySchemes:
@@ -18,31 +18,41 @@ components:
       type: object
       required: [session_id, text]
       properties:
-        session_id: { type: string }
-        text: { type: string }
+        session_id:
+          type: string
+        text:
+          type: string
 
     TurnResponse:
       type: object
       required: [session_id, output]
       properties:
-        session_id: { type: string }
-        output: { type: string }
+        session_id:
+          type: string
+        output:
+          type: string
 
     RollReq:
       type: object
       required: [expr]
       properties:
-        expr: { type: string }
-        session_id: { type: string }
-        label: { type: string }
+        expr:
+          type: string
+        session_id:
+          type: string
+        label:
+          type: string
 
     RollResp:
       type: object
       required: [total, detail, text, raw]
       properties:
-        total: { type: integer }
-        detail: { type: string }
-        text: { type: string }
+        total:
+          type: integer
+        detail:
+          type: string
+        text:
+          type: string
         raw:
           type: object
           additionalProperties: true
@@ -51,22 +61,29 @@ components:
       type: object
       required: [bonus, dc]
       properties:
-        bonus: { type: integer }
-        dc: { type: integer }
+        bonus:
+          type: integer
+        dc:
+          type: integer
         mode:
           type: string
           enum: [normal, adv, dis]
           default: normal
-        session_id: { type: string }
-        label: { type: string }
+        session_id:
+          type: string
+        label:
+          type: string
 
     SkillCheckResp:
       type: object
       required: [ok, total, text, raw]
       properties:
-        ok: { type: boolean }
-        total: { type: integer }
-        text: { type: string }
+        ok:
+          type: boolean
+        total:
+          type: integer
+        text:
+          type: string
         raw:
           type: object
           additionalProperties: true
@@ -75,39 +92,52 @@ components:
       type: object
       required: [attack_bonus, target_ac]
       properties:
-        attack_bonus: { type: integer }
-        target_ac: { type: integer }
+        attack_bonus:
+          type: integer
+        target_ac:
+          type: integer
         mode:
           type: string
           enum: [normal, adv, dis]
           default: normal
-        session_id: { type: string }
-        label: { type: string }
-        damage_expr: { type: string }
+        session_id:
+          type: string
+        label:
+          type: string
+        damage_expr:
+          type: string
 
     AttackResp:
       type: object
       required: [hit, crit, total, text, raw]
       properties:
-        hit: { type: boolean }
-        crit: { type: boolean }
-        total: { type: integer }
-        text: { type: string }
+        hit:
+          type: boolean
+        crit:
+          type: boolean
+        total:
+          type: integer
+        text:
+          type: string
         raw:
           type: object
           additionalProperties: true
-        damage_total: { type: integer }
-        damage_detail: { type: string }
+        damage_total:
+          type: integer
+        damage_detail:
+          type: string
         damage_raw:
           type: object
           additionalProperties: true
 
     SessionDumpResp:
       type: object
-      required: [ok, session_id]
+      required: [ok, session_id, history, scene, flags, module_progress]
       properties:
-        ok: { type: boolean }
-        session_id: { type: string }
+        ok:
+          type: boolean
+        session_id:
+          type: string
         history:
           type: array
           items:
@@ -147,7 +177,7 @@ paths:
 
   /turn:
     post:
-      operationId: turn
+      operationId: dm_turn
       summary: Run one DM agent turn
       requestBody:
         required: true
@@ -183,7 +213,7 @@ paths:
 
   /skill_check:
     post:
-      operationId: skillCheck
+      operationId: skill_check
       summary: Skill/ability check with bonus vs DC (supports adv/dis)
       requestBody:
         required: true
@@ -219,8 +249,8 @@ paths:
 
   /session/reset/{session_id}:
     post:
-      operationId: sessionReset
-      summary: Reset a session (path param)
+      operationId: reset_session
+      summary: Reset a session
       parameters:
         - name: session_id
           in: path
@@ -233,7 +263,7 @@ paths:
 
   /session/{session_id}:
     get:
-      operationId: sessionDump
+      operationId: get_session
       summary: Dump stored session (history/scene/flags/module_progress)
       parameters:
         - name: session_id
