@@ -349,9 +349,9 @@ def favicon():
 
 
 # -----------------------------
-# Turno DM (PERMISIVO + EXTRACTOR)
+# Turno DM (operation_id alineado con OpenAPI: dm_turn)
 # -----------------------------
-@app.post("/turn", response_model=TurnResponse, operation_id="turn")
+@app.post("/turn", response_model=TurnResponse, operation_id="dm_turn")
 def turn(req: TurnRequest):
     if AGENT_IMPORT_ERROR or not AgentState or not run_agent_turn:
         raise HTTPException(status_code=503, detail=f"Agente no disponible: {AGENT_IMPORT_ERROR}")
@@ -383,13 +383,15 @@ def turn(req: TurnRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error guardando sesión: {e}")
 
+    # Si ya viene formateado con RESOLUCIÓN (mecánica), lo devolvemos tal cual.
+    # Si no, lo envolvemos de forma permisiva + extractor.
     text = str(raw_output or "").strip()
 
     def _has_resolution_block(t: str) -> bool:
         up = t.upper()
         return ("RESOLUCIÓN" in up) and ("MECÁNICA" in up)
 
-    # Heurística: keywords/patrones mecánicos (sin inventar números)
+    # Heurística de extracción mecánica (sin inventar números)
     MECH_PAT = re.compile(
         r"("
         r"\bd20\b|"
@@ -411,41 +413,26 @@ def turn(req: TurnRequest):
     )
 
     def _split_into_chunks(t: str) -> list[str]:
-        """
-        Divide el texto en 'chunks' para extracción:
-        - respeta saltos de línea si existen
-        - si no, intenta separar por frases (.!? ¿?)
-        """
         if "\n" in t:
             return [ln.strip() for ln in t.splitlines() if ln.strip()]
-        # separa por fin de frase o saltos fuertes
         parts = re.split(r"(?<=[\.\!\?\u00BF\u00A1])\s+", t.strip())
         return [p.strip() for p in parts if p and p.strip()]
 
     def _extract_mechanics_and_narration(t: str) -> tuple[list[str], str]:
-        """
-        Extrae chunks con patrón mecánico -> mechanics_lines
-        El resto -> narration_text
-        Manejo simple de bloques ```...```: si contienen keywords, se tratan como mecánica.
-        """
         mechanics_lines: list[str] = []
         narration_chunks: list[str] = []
 
-        # Si hay bloques de código, extrae por bloques primero
         if "```" in t:
-            # Particiona conservando delimitadores
             segments = re.split(r"(```.*?```)", t, flags=re.DOTALL)
             for seg in segments:
                 if not seg or not seg.strip():
                     continue
                 if seg.startswith("```") and seg.endswith("```"):
-                    # bloque literal
                     if MECH_PAT.search(seg):
                         mechanics_lines.append(seg.strip())
                     else:
                         narration_chunks.append(seg.strip())
                 else:
-                    # texto normal
                     for ch in _split_into_chunks(seg):
                         if MECH_PAT.search(ch):
                             mechanics_lines.append(ch)
@@ -461,17 +448,15 @@ def turn(req: TurnRequest):
         narration_text = "\n".join(narration_chunks).strip()
         return mechanics_lines, narration_text
 
-    # Si ya viene formateado, lo devolvemos tal cual
     if _has_resolution_block(text):
         return TurnResponse(session_id=req.session_id, output=text)
 
-    # Permisivo + extractor: envolvemos SIEMPRE
+    # Permisivo + extractor: envolvemos siempre
     ctx = TurnContext()
     mech_lines, narration_text = _extract_mechanics_and_narration(text)
 
     if mech_lines:
-        # Volcar lo extraído a RESOLUCIÓN (mecánica) sin inventar nada
-        for ln in mech_lines[:80]:  # límite de seguridad
+        for ln in mech_lines[:80]:
             try:
                 ctx.mech(ln)
             except Exception:
@@ -481,7 +466,6 @@ def turn(req: TurnRequest):
         except Exception:
             pass
     else:
-        # sin mecánica visible
         narration_text = narration_text or text
         try:
             ctx.log_event("Salida envuelta en formato fijo (sin mecánica visible).")
@@ -489,7 +473,7 @@ def turn(req: TurnRequest):
             pass
 
     wrapped = format_turn_output(
-        ctx=ctx,  # si no hay mech_lines, quedará "(sin tiradas)" por tu formateador
+        ctx=ctx,
         interpretation=(
             "Salida envuelta en formato fijo. "
             "Si hay discrepancias, ajusta el agente para emitir 'RESOLUCIÓN (mecánica)' de origen."
@@ -498,6 +482,24 @@ def turn(req: TurnRequest):
         options=[],
     )
     return TurnResponse(session_id=req.session_id, output=wrapped)
+
+
+# -----------------------------
+# Skill check endpoint (operation_id alineado con OpenAPI: skill_check)
+# -----------------------------
+@app.post("/skill_check", operation_id="skill_check")
+def skill_check_endpoint(req: SkillCheckReq):
+    ok, total, txt, raw = _skill_check(bonus=req.bonus, dc=req.dc, mode=req.mode)
+    text = f"{req.label + ': ' if req.label else ''}{txt}"
+
+    if req.session_id:
+        _append_session_event(
+            req.session_id,
+            "skill_check",
+            {"bonus": req.bonus, "dc": req.dc, "mode": req.mode, "ok": ok, "total": total, "label": req.label},
+        )
+
+    return {"ok": ok, "total": total, "text": text, "raw": raw}
 
 
 # -----------------------------
