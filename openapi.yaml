@@ -224,7 +224,7 @@ paths:
   /session/reset/{session_id}:
     post:
       operationId: reset_session
-      summary: Reset a session (path param)
+      summary: Reset a session
       parameters:
         - name: session_id
           in: path
@@ -238,7 +238,7 @@ paths:
   /session/{session_id}:
     get:
       operationId: get_session
-      summary: Dump stored session history
+      summary: Dump stored session (history/scene/flags/module_progress)
       parameters:
         - name: session_id
           in: path
