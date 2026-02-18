@@ -490,7 +490,7 @@ def skill_check_endpoint(req: SkillCheckReq):
 # -----------------------------
 # Reset sesión (path param - fiable para Actions)
 # -----------------------------
-@app.post("/session/reset/{session_id}")
+@app.post("/session/reset/{session_id}", operation_id="reset_session")
 def session_reset_path(session_id: str) -> Dict[str, Any]:
     if not session_id or not session_id.strip():
         raise HTTPException(status_code=422, detail="session_id requerido")
@@ -513,7 +513,7 @@ def session_reset_path(session_id: str) -> Dict[str, Any]:
 # -----------------------------
 # Dump sesión (incluye scene/flags/module_progress)
 # -----------------------------
-@app.get("/session/{session_id}")
+@app.get("/session/{session_id}", operation_id="get_session")
 def session_dump(session_id: str) -> Dict[str, Any]:
     p = _session_path(session_id)
     if not p.exists():
