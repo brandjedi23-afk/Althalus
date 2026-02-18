@@ -1,13 +1,33 @@
 openapi: 3.1.0
 info:
   title: DM Agent API
-  version: "1.2.0"
+  version: "1.2.2"
 
 servers:
   - url: https://ubiquitous-space-giggle-r49rgrw5g6qwhv9p-8000.app.github.dev
 
-ccomponents:
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-KEY
+
   schemas:
+    TurnRequest:
+      type: object
+      required: [session_id, text]
+      properties:
+        session_id: { type: string }
+        text: { type: string }
+
+    TurnResponse:
+      type: object
+      required: [session_id, output]
+      properties:
+        session_id: { type: string }
+        output: { type: string }
+
     RollReq:
       type: object
       required: [expr]
@@ -15,6 +35,17 @@ ccomponents:
         expr: { type: string }
         session_id: { type: string }
         label: { type: string }
+
+    RollResp:
+      type: object
+      required: [total, detail, text, raw]
+      properties:
+        total: { type: integer }
+        detail: { type: string }
+        text: { type: string }
+        raw:
+          type: object
+          additionalProperties: true
 
     SkillCheckReq:
       type: object
@@ -28,6 +59,17 @@ ccomponents:
           default: normal
         session_id: { type: string }
         label: { type: string }
+
+    SkillCheckResp:
+      type: object
+      required: [ok, total, text, raw]
+      properties:
+        ok: { type: boolean }
+        total: { type: integer }
+        text: { type: string }
+        raw:
+          type: object
+          additionalProperties: true
 
     AttackReq:
       type: object
@@ -43,11 +85,43 @@ ccomponents:
         label: { type: string }
         damage_expr: { type: string }
 
-  securitySchemes:
-    ApiKeyAuth:
-      type: apiKey
-      in: header
-      name: X-API-KEY
+    AttackResp:
+      type: object
+      required: [hit, crit, total, text, raw]
+      properties:
+        hit: { type: boolean }
+        crit: { type: boolean }
+        total: { type: integer }
+        text: { type: string }
+        raw:
+          type: object
+          additionalProperties: true
+        damage_total: { type: integer }
+        damage_detail: { type: string }
+        damage_raw:
+          type: object
+          additionalProperties: true
+
+    SessionDumpResp:
+      type: object
+      required: [ok, session_id]
+      properties:
+        ok: { type: boolean }
+        session_id: { type: string }
+        history:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        scene:
+          type: object
+          additionalProperties: true
+        flags:
+          type: object
+          additionalProperties: true
+        module_progress:
+          type: object
+          additionalProperties: true
 
 security:
   - ApiKeyAuth: []
@@ -80,56 +154,16 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [session_id, text]
-              properties:
-                session_id:
-                  type: string
-                text:
-                  type: string
+              $ref: "#/components/schemas/TurnRequest"
       responses:
         "200":
           description: OK
           content:
             application/json:
               schema:
-                type: object
-                required: [session_id, output]
-                properties:
-                  session_id:
-                    type: string
-                  output:
-                    type: string
+                $ref: "#/components/schemas/TurnResponse"
 
-  /session/reset:
-    post:
-      operationId: sessionReset
-      summary: Reset a session
-      parameters:
-        - name: session_id
-          in: query
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: OK
-
-  /session/{session_id}:
-    get:
-      operationId: sessionDump
-      summary: Dump stored session history
-      parameters:
-        - name: session_id
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: OK
-  
-    /roll:
+  /roll:
     post:
       operationId: roll
       summary: Roll a dice expression (e.g., 2d6+3)
@@ -142,6 +176,10 @@ paths:
       responses:
         "200":
           description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RollResp"
 
   /skill_check:
     post:
@@ -156,6 +194,10 @@ paths:
       responses:
         "200":
           description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SkillCheckResp"
 
   /attack:
     post:
@@ -170,3 +212,39 @@ paths:
       responses:
         "200":
           description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AttackResp"
+
+  /session/reset/{session_id}:
+    post:
+      operationId: sessionReset
+      summary: Reset a session (path param)
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+
+  /session/{session_id}:
+    get:
+      operationId: sessionDump
+      summary: Dump stored session (history/scene/flags/module_progress)
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionDumpResp"
