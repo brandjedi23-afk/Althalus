@@ -333,6 +333,15 @@ def favicon():
     return Response(status_code=204)
 
 
+@app.get("/routes")
+def routes():
+    return sorted(
+        [{"path": r.path, "methods": sorted(list(getattr(r, "methods", []) or []))}
+         for r in app.routes],
+        key=lambda x: x["path"]
+    )
+
+
 # -----------------------------
 # Turno DM (operation_id alineado con OpenAPI: dm_turn)
 # -----------------------------
