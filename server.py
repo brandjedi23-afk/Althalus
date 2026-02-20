@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Endpoints mecánicos WoT
 from wot_dice import roll_expr, skill_check as _skill_check, attack_roll as _attack_roll
@@ -96,15 +96,36 @@ async def require_token(request: Request, call_next):
 # -----------------------------
 # Modelos
 # -----------------------------
+
+Mode = Literal["normal", "adv", "dis"]
+
 class TurnRequest(BaseModel):
     session_id: str
     text: str
-
 
 class TurnResponse(BaseModel):
     session_id: str
     output: str
 
+class RollReq(BaseModel):
+    expr: str
+    label: Optional[str] = None
+    session_id: Optional[str] = None
+
+class SkillCheckReq(BaseModel):
+    bonus: int
+    dc: int
+    mode: str = Field(default="normal", pattern="^(normal|adv|dis)$")
+    label: Optional[str] = None
+    session_id: Optional[str] = None
+
+class AttackReq(BaseModel):
+    attack_bonus: int
+    target_ac: int
+    mode: str = Field(default="normal", pattern="^(normal|adv|dis)$")
+    damage_expr: Optional[str] = None
+    label: Optional[str] = None
+    session_id: Optional[str] = None
 
 # =============================
 # (4.1) Endpoints mecánicos WoT
@@ -121,7 +142,7 @@ class RollReq(BaseModel):
 class SkillCheckReq(BaseModel):
     bonus: int
     dc: int
-    mode: Mode = "normal"
+    mode: Mode = "normal"  # type: ignore
     session_id: Optional[str] = None
     label: Optional[str] = None
 
@@ -129,7 +150,7 @@ class SkillCheckReq(BaseModel):
 class AttackReq(BaseModel):
     attack_bonus: int
     target_ac: int
-    mode: Mode = "normal"
+    mode: Mode = "normal"  # type: ignore
     session_id: Optional[str] = None
     label: Optional[str] = None
     damage_expr: Optional[str] = None  # opcional: si impacta, tira daño
@@ -144,26 +165,36 @@ def _events_path(session_id: str) -> Path:
 
 def _append_session_event(session_id: str, kind: str, payload: Dict[str, Any]) -> None:
     """
-    Log ligero en JSONL para auditoría mecánica sin tocar el state JSON principal
-    (evita conflictos con save/load del AgentState).
+    Log ligero en el JSON de sesión. No rompe nada si el fichero no existe.
+    Guarda en: {"events":[{"kind":..., "payload":...}, ...]}
     """
     try:
-        from datetime import datetime, timezone
-        p = _events_path(session_id)
-        event = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "kind": kind,
-            "payload": payload,
-        }
-        with p.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        p = _session_path(session_id)
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        else:
+            data = {}
+
+        events = data.get("events", [])
+        if not isinstance(events, list):
+            events = []
+
+        events.append({"kind": kind, "payload": payload})
+        data["events"] = events
+
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
-        # logging no debe romper la respuesta
-        pass
+        # logging best-effort, no bloquea
+        return
 
 
 @app.post("/roll", operation_id="roll")
 def roll_endpoint(req: RollReq):
+    if not req.expr or not req.expr.strip():
+        raise HTTPException(status_code=400, detail="expr vacío")
+
     r = roll_expr(req.expr)
     text = f"{req.label + ': ' if req.label else ''}{r.detail}"
 
@@ -483,17 +514,73 @@ def turn(req: TurnRequest):
 # -----------------------------
 @app.post("/skill_check", operation_id="skill_check")
 def skill_check_endpoint(req: SkillCheckReq):
-    ok, total, txt, raw = _skill_check(bonus=req.bonus, dc=req.dc, mode=req.mode)
-    text = f"{req.label + ': ' if req.label else ''}{txt}"
+    # Asumimos firma tipo: success, total, txt, raw = _skill_check(bonus, dc, mode)
+    res = _skill_check(bonus=req.bonus, dc=req.dc, mode=req.mode)
+
+    # tolerante por si cambia la tupla
+    if isinstance(res, tuple) and len(res) >= 4:
+        success = bool(res[0])
+        total = int(res[1])
+        txt = str(res[2])
+        raw = res[3]
+    else:
+        # fallback ultra defensivo
+        success, total, txt, raw = False, 0, str(res), {}
+
+    text = (req.label + ": " if req.label else "") + txt
 
     if req.session_id:
         _append_session_event(
             req.session_id,
             "skill_check",
-            {"bonus": req.bonus, "dc": req.dc, "mode": req.mode, "ok": ok, "total": total, "label": req.label},
+            {"bonus": req.bonus, "dc": req.dc, "mode": req.mode, "success": success, "total": total, "label": req.label},
         )
 
-    return {"ok": ok, "total": total, "text": text, "raw": raw}
+    return {"success": success, "total": total, "dc": req.dc, "text": text, "raw": raw}
+
+# -----------------------------
+# Attack endpoint (operation_id alineado con OpenAPI: attack)
+# -----------------------------
+@app.post("/attack", operation_id="attack")
+def attack_endpoint(req: AttackReq):
+    hit, crit, total, txt, raw = _attack_roll(
+        attack_bonus=req.attack_bonus,
+        target_ac=req.target_ac,
+        mode=req.mode,
+    )
+
+    out: Dict[str, Any] = {
+        "hit": hit,
+        "crit": crit,
+        "total": total,
+        "text": (req.label + ": " if req.label else "") + txt,
+        "raw": raw,
+    }
+
+    # Daño opcional
+    if hit and req.damage_expr:
+        dmg = roll_expr(req.damage_expr)
+        out["damage_total"] = dmg.total
+        out["damage_detail"] = dmg.detail
+        out["damage_raw"] = dmg.raw
+
+    if req.session_id:
+        _append_session_event(
+            req.session_id,
+            "attack",
+            {
+                "attack_bonus": req.attack_bonus,
+                "target_ac": req.target_ac,
+                "mode": req.mode,
+                "hit": hit,
+                "crit": crit,
+                "total": total,
+                "damage_expr": req.damage_expr,
+                "label": req.label,
+            },
+        )
+
+    return out
 
 
 # -----------------------------
@@ -545,5 +632,6 @@ def session_dump(session_id: str) -> Dict[str, Any]:
         "history": data.get("history", []) if isinstance(data.get("history", []), list) else [],
         "scene": data.get("scene", {}) if isinstance(data.get("scene", {}), dict) else {},
         "flags": data.get("flags", {}) if isinstance(data.get("flags", {}), dict) else {},
-        "module_progress": data.get("module_progress", {}) if isinstance(data.get("module_progress", {}), dict) else {},
+        "module_progress": data.get("module_progress", {}) if isinstance(data.get("module_progress", {}), dict) else [],
+        "events": data.get("events", []) if isinstance(data.get("events", []), list) else [],
     }
